@@ -180,7 +180,8 @@ static BOOL AIVPathHasSymlink(NSURL *destination) {
 
 @implementation AIVArchive
 
-+ (NSArray<NSDictionary *> *)fileDescriptors:(NSError **)error {
++ (NSArray<NSDictionary *> *)fileDescriptorsWithWarnings:(NSMutableArray<NSString *> *)warnings
+                                                    error:(NSError **)error {
     NSFileManager *fm = NSFileManager.defaultManager;
     NSMutableArray<NSDictionary *> *descriptors = [NSMutableArray array];
     NSMutableDictionary<NSString *, NSURL *> *roots = [NSMutableDictionary dictionary];
@@ -199,7 +200,13 @@ static BOOL AIVPathHasSymlink(NSURL *destination) {
         __block NSError *enumerationError = nil;
         NSDirectoryEnumerator *it = [fm enumeratorAtURL:root includingPropertiesForKeys:keys
                  options:NSDirectoryEnumerationSkipsHiddenFiles
-            errorHandler:^BOOL(__unused NSURL *url, NSError *fileError) {
+            errorHandler:^BOOL(NSURL *url, NSError *fileError) {
+                // Apps remove journal/temporary files while an enumeration is in progress.
+                if (fileError.code == NSFileNoSuchFileError &&
+                    [fileError.domain isEqualToString:NSCocoaErrorDomain]) {
+                    [warnings addObject:[NSString stringWithFormat:@"A temporary file disappeared: %@", url.lastPathComponent]];
+                    return YES;
+                }
                 enumerationError = fileError;
                 return NO;
             }];
@@ -214,6 +221,12 @@ static BOOL AIVPathHasSymlink(NSURL *destination) {
                 [it skipDescendants];
                 continue;
             }
+            // SQLite journals/WAL/SHM files come and go while the app is running.
+            // SQLite databases are captured separately with sqlite3_backup(),
+            // which includes committed WAL transactions in a consistent snapshot.
+            NSString *name = url.lastPathComponent.lowercaseString;
+            if ([name hasSuffix:@"-journal"] || [name hasSuffix:@"-wal"] ||
+                [name hasSuffix:@"-shm"] || [name hasSuffix:@".aivtmp"]) continue;
             NSNumber *regular = nil, *link = nil, *size = nil;
             [url getResourceValue:&regular forKey:NSURLIsRegularFileKey error:NULL];
             [url getResourceValue:&link forKey:NSURLIsSymbolicLinkKey error:NULL];

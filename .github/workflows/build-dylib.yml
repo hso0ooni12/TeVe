@@ -38,6 +38,7 @@ jobs:
             -framework Security \
             -framework UniformTypeIdentifiers \
             -framework CoreGraphics \
+            -lsqlite3 \
             -o build/AppIdentityVault.dylib
           codesign --force --sign - build/AppIdentityVault.dylib
           file build/AppIdentityVault.dylib

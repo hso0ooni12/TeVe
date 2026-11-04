@@ -8,7 +8,8 @@ NS_ASSUME_NONNULL_BEGIN
 + (nullable NSDictionary *)decode:(NSData *)plain error:(NSError **)error;
 + (NSDictionary *)restore:(NSDictionary *)archive error:(NSError **)error;
 /// Streaming v2 helpers: enumerate paths without loading file contents into memory.
-+ (nullable NSArray<NSDictionary *> *)fileDescriptors:(NSError **)error;
++ (nullable NSArray<NSDictionary *> *)fileDescriptorsWithWarnings:(NSMutableArray<NSString *> *)warnings
+                                                             error:(NSError **)error;
 + (NSDictionary *)captureMetadata;
 + (nullable NSURL *)restoreDestinationForPath:(NSString *)path;
 @end

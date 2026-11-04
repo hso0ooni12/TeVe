@@ -3,6 +3,8 @@
 #import "AIVCrypto.h"
 #import <CommonCrypto/CommonCrypto.h>
 #import <Security/Security.h>
+#import <sqlite3.h>
+#import <sys/stat.h>
 #import <string.h>
 
 static NSString *const AIVStreamDomain = @"com.appidentityvault.stream";
@@ -35,6 +37,54 @@ static NSData *AIVRecordHeader(uint8_t type, uint32_t nameLength, uint64_t value
     memcpy(header + 1, &nameBE, 4);
     memcpy(header + 5, &valueBE, 8);
     return [NSData dataWithBytes:header length:sizeof(header)];
+}
+
+// SQLite's -journal/-wal/-shm files are volatile, so copy the logical database
+// through SQLite's online backup API, including committed transactions in WAL.
+static BOOL AIVHasSQLiteHeader(NSFileHandle *handle) {
+    if (!handle) return NO;
+    NSData *prefix = [handle readDataOfLength:16];
+    [handle seekToFileOffset:0];
+    return prefix.length == 16 && memcmp(prefix.bytes, "SQLite format 3\0", 16) == 0;
+}
+
+static NSURL *AIVSQLiteSnapshot(NSURL *sourceURL, NSURL *directory, NSError **error) {
+    NSURL *targetURL = [directory URLByAppendingPathComponent:
+                        [NSUUID.UUID.UUIDString stringByAppendingString:@".sqlite"]];
+    sqlite3 *source = NULL, *target = NULL;
+    sqlite3_backup *backup = NULL;
+    int result = sqlite3_open_v2(sourceURL.fileSystemRepresentation, &source,
+                                 SQLITE_OPEN_READONLY | SQLITE_OPEN_FULLMUTEX, NULL);
+    if (result == SQLITE_OK) result = sqlite3_open_v2(targetURL.fileSystemRepresentation,
+                    &target, SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE | SQLITE_OPEN_FULLMUTEX, NULL);
+    if (result == SQLITE_OK) {
+        sqlite3_busy_timeout(source, 1000);
+        sqlite3_busy_timeout(target, 1000);
+        backup = sqlite3_backup_init(target, "main", source, "main");
+        if (!backup) result = sqlite3_errcode(target);
+    }
+    if (backup) {
+        NSUInteger retries = 0;
+        do {
+            result = sqlite3_backup_step(backup, 128);
+            if (result == SQLITE_BUSY || result == SQLITE_LOCKED) {
+                if (++retries > 30) break;
+                sqlite3_sleep(100);
+            } else retries = 0;
+        } while (result == SQLITE_OK || result == SQLITE_BUSY || result == SQLITE_LOCKED);
+        int finished = sqlite3_backup_finish(backup);
+        if (result == SQLITE_DONE && finished == SQLITE_OK) result = SQLITE_OK;
+        else if (result == SQLITE_DONE) result = finished;
+    }
+    if (source) sqlite3_close(source);
+    if (target) sqlite3_close(target);
+    if (result != SQLITE_OK) {
+        if (error) *error = AIVSErr(27, [NSString stringWithFormat:
+            @"Could not consistently snapshot the database %@ (SQLite %d).", sourceURL.lastPathComponent, result]);
+        [NSFileManager.defaultManager removeItemAtURL:targetURL error:NULL];
+        return nil;
+    }
+    return targetURL;
 }
 
 @interface AIVEncryptedWriter : NSObject {
@@ -315,6 +365,20 @@ static NSDictionary *AIVParse(AIVEncryptedReader *reader, BOOL restore, NSError 
                 return nil;
             }
             manifest = m;
+            [warnings addObjectsFromArray:[m[@"warnings"] isKindOfClass:NSArray.class] ? m[@"warnings"] : @[]];
+            continue;
+        }
+        if (raw[0] == 3) {
+            if (!manifest || nameLength || valueLength > 2ULL * 1024ULL * 1024ULL) {
+                if (error) *error = AIVSErr(28, @"Invalid backup warning record.");
+                return nil;
+            }
+            NSData *data = [reader readExactly:(NSUInteger)valueLength error:error];
+            if (!data) return nil;
+            id additions = [NSPropertyListSerialization propertyListWithData:data
+                options:NSPropertyListImmutable format:NULL error:error];
+            if (![additions isKindOfClass:NSArray.class]) return nil;
+            for (id warning in additions) if ([warning isKindOfClass:NSString.class]) [warnings addObject:warning];
             continue;
         }
         if (raw[0] != 2 || !manifest || nameLength == 0) {
@@ -389,39 +453,76 @@ static NSDictionary *AIVParse(AIVEncryptedReader *reader, BOOL restore, NSError 
         report[@"idfvOverride"] = keychainReport[@"idfvOverride"] ?: @NO;
         report[@"warnings"] = warnings;
     }
+    if (!restore) report[@"warnings"] = warnings;
     return report;
 }
 
 @implementation AIVStream
 
 + (BOOL)createBackupAtURL:(NSURL *)url password:(NSString *)password error:(NSError **)error {
-    NSArray<NSDictionary *> *descriptors = [AIVArchive fileDescriptors:error];
+    NSMutableArray<NSString *> *scanWarnings = [NSMutableArray array];
+    NSArray<NSDictionary *> *descriptors = [AIVArchive fileDescriptorsWithWarnings:scanWarnings error:error];
     if (!descriptors) return NO;
-    NSDictionary *metadata = [AIVArchive captureMetadata];
+    NSMutableDictionary *metadata = [[AIVArchive captureMetadata] mutableCopy];
+    [scanWarnings addObjectsFromArray:metadata[@"warnings"] ?: @[]];
+    metadata[@"warnings"] = scanWarnings;
     NSData *plist = [NSPropertyListSerialization dataWithPropertyList:metadata
                  format:NSPropertyListBinaryFormat_v1_0 options:0 error:error];
     if (!plist) return NO;
+    NSString *snapshotPath = [NSTemporaryDirectory() stringByAppendingPathComponent:
+        [NSString stringWithFormat:@"AppIdentityVault-%@", NSUUID.UUID.UUIDString]];
+    NSURL *snapshotDirectory = [NSURL fileURLWithPath:snapshotPath isDirectory:YES];
+    if (![NSFileManager.defaultManager createDirectoryAtURL:snapshotDirectory
+        withIntermediateDirectories:YES attributes:nil error:error]) return NO;
     NSURL *partial = [url URLByAppendingPathExtension:@"part"];
     AIVEncryptedWriter *writer = [[AIVEncryptedWriter alloc] initWithURL:partial
                                                            password:password error:error];
-    if (!writer) return NO;
+    if (!writer) {
+        [NSFileManager.defaultManager removeItemAtURL:snapshotDirectory error:NULL];
+        [NSFileManager.defaultManager removeItemAtURL:partial error:NULL];
+        return NO;
+    }
+    NSMutableArray<NSString *> *lateWarnings = [NSMutableArray array];
     BOOL ok = AIVWriteRecord(writer, 1, @"", plist, error);
     for (NSDictionary *entry in descriptors) {
         if (!ok) break;
         NSURL *fileURL = entry[@"url"];
         NSString *path = entry[@"path"];
-        NSNumber *size = entry[@"size"];
         NSData *pathData = [path dataUsingEncoding:NSUTF8StringEncoding];
         if (!pathData.length || pathData.length > 4096) {
             if (error) *error = AIVSErr(25, @"App file path is too long.");
             ok = NO; break;
         }
-        NSFileHandle *input = [NSFileHandle fileHandleForReadingFromURL:fileURL error:error];
-        if (!input) { ok = NO; break; }
+        NSError *openError = nil;
+        NSFileHandle *input = [NSFileHandle fileHandleForReadingFromURL:fileURL error:&openError];
+        if (!input) {
+            // Files deleted during enumeration were never backed up; continue
+            // without inserting a malformed record into the encrypted stream.
+            if (![NSFileManager.defaultManager fileExistsAtPath:fileURL.path]) {
+                [lateWarnings addObject:[NSString stringWithFormat:@"Skipped a file removed during backup: %@", path]];
+                continue;
+            }
+            if (error) *error = openError ?: AIVSErr(29, @"Unable to open an app file.");
+            ok = NO; break;
+        }
+        NSURL *sqliteCopy = nil;
+        if (AIVHasSQLiteHeader(input)) {
+            [input closeFile];
+            sqliteCopy = AIVSQLiteSnapshot(fileURL, snapshotDirectory, error);
+            if (!sqliteCopy) { ok = NO; break; }
+            input = [NSFileHandle fileHandleForReadingFromURL:sqliteCopy error:error];
+            if (!input) { ok = NO; break; }
+        }
+        struct stat attributes;
+        if (fstat(input.fileDescriptor, &attributes) != 0 || attributes.st_size < 0) {
+            if (error) *error = AIVSErr(30, @"Could not determine the app file size.");
+            [input closeFile]; ok = NO; break;
+        }
+        uint64_t currentSize = (uint64_t)attributes.st_size;
         ok = [writer append:AIVRecordHeader(2, (uint32_t)pathData.length,
-                                            size.unsignedLongLongValue) error:error] &&
+                                            currentSize) error:error] &&
              [writer append:pathData error:error];
-        uint64_t left = size.unsignedLongLongValue;
+        uint64_t left = currentSize;
         while (ok && left) {
             NSData *chunk = [input readDataOfLength:(NSUInteger)MIN((uint64_t)AIVChunk, left)];
             if (!chunk.length) {
@@ -433,11 +534,17 @@ static NSDictionary *AIVParse(AIVEncryptedReader *reader, BOOL restore, NSError 
         }
         [input closeFile];
     }
+    if (ok && lateWarnings.count) {
+        NSData *warningPlist = [NSPropertyListSerialization dataWithPropertyList:lateWarnings
+            format:NSPropertyListBinaryFormat_v1_0 options:0 error:error];
+        ok = warningPlist && AIVWriteRecord(writer, 3, @"", warningPlist, error);
+    }
     if (ok) ok = [writer append:AIVRecordHeader(0, 0, 0) error:error];
     if (ok) ok = [writer finish:error];
     writer = nil;
     if (ok) ok = [[NSFileManager defaultManager] moveItemAtURL:partial toURL:url error:error];
     if (!ok) [[NSFileManager defaultManager] removeItemAtURL:partial error:NULL];
+    [NSFileManager.defaultManager removeItemAtURL:snapshotDirectory error:NULL];
     return ok;
 }
 
