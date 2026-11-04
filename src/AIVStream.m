@@ -386,6 +386,7 @@ static NSDictionary *AIVParse(AIVEncryptedReader *reader, BOOL restore, NSError 
         report[@"files"] = @(restored);
         report[@"keychainRestored"] = keychainReport[@"keychain"] ?: @0;
         report[@"fcUUIDRestored"] = keychainReport[@"fcUUID"] ?: @NO;
+        report[@"idfvOverride"] = keychainReport[@"idfvOverride"] ?: @NO;
         report[@"warnings"] = warnings;
     }
     return report;

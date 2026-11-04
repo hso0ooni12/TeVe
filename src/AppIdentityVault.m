@@ -1,6 +1,8 @@
 #import <Foundation/Foundation.h>
 #import <UIKit/UIKit.h>
 #import <UniformTypeIdentifiers/UniformTypeIdentifiers.h>
+#import <objc/runtime.h>
+#import <stdlib.h>
 #import "AIVArchive.h"
 #import "AIVCrypto.h"
 #import "AIVStream.h"
@@ -8,6 +10,23 @@
 static NSString *AIVL(NSString *arabic, NSString *english) {
     NSString *lang = NSLocale.preferredLanguages.firstObject ?: @"en";
     return [lang hasPrefix:@"ar"] ? arabic : english;
+}
+
+// This alters only what calls inside the *injected application process* see.
+// It cannot change the OS-provided vendor identity, code-signing Team ID, or App Attest.
+static IMP AIVOriginalIDFV = NULL;
+static NSUUID *AIVRestoredIDFV = nil;
+static NSUUID *AIVIdentifierForVendor(id target, SEL selector) {
+    if (AIVRestoredIDFV) return AIVRestoredIDFV;
+    return AIVOriginalIDFV ? ((NSUUID *(*)(id, SEL))AIVOriginalIDFV)(target, selector) : nil;
+}
+
+static void AIVInstallIDFVOverride(void) {
+    NSString *saved = [NSUserDefaults.standardUserDefaults
+                        stringForKey:@"com.appidentityvault.override-idfv"];
+    AIVRestoredIDFV = [[NSUUID alloc] initWithUUIDString:saved ?: @""];
+    Method method = class_getInstanceMethod(UIDevice.class, @selector(identifierForVendor));
+    if (method) AIVOriginalIDFV = method_setImplementation(method, (IMP)AIVIdentifierForVendor);
 }
 
 @interface AIVOverlay : NSObject <UIDocumentPickerDelegate>
@@ -216,14 +235,29 @@ static NSString *AIVL(NSString *arabic, NSString *english) {
             dispatch_async(dispatch_get_main_queue(), ^{
                 NSUInteger issues = [report[@"warnings"] count];
                 NSString *message = error.localizedDescription ?: [NSString stringWithFormat:
-                    AIVL(@"تمت استعادة %@ ملف و%@ سجل Keychain. FCUUID: %@. تحذيرات: %lu. أغلق التطبيق بالكامل وافتحه لفحص الحساب.",
-                         @"Restored %@ files and %@ Keychain records. FCUUID: %@. Warnings: %lu. Force close and reopen to check the account."),
+                    AIVL(@"تمت استعادة %@ ملف و%@ سجل Keychain. FCUUID: %@، IDFV: %@. تحذيرات: %lu. سيُغلق التطبيق الآن حتى تُحمَّل الهوية عند فتحه من جديد.",
+                         @"Restored %@ files and %@ Keychain records. FCUUID: %@, IDFV: %@. Warnings: %lu. The app will close so the restored values are loaded next launch."),
                     report[@"files"] ?: @0, report[@"keychainRestored"] ?: @0,
                     [report[@"fcUUIDRestored"] boolValue] ? AIVL(@"نعم", @"yes") : AIVL(@"غير متاح", @"unavailable"),
+                    [report[@"idfvOverride"] boolValue] ? AIVL(@"داخل التطبيق", @"in-app override") : AIVL(@"غير متاح", @"unavailable"),
                     (unsigned long)issues];
                 if (issues) message = [message stringByAppendingFormat:@"\n%@",
                                      [[report[@"warnings"] subarrayWithRange:NSMakeRange(0, MIN(issues, 3))] componentsJoinedByString:@"\n"]];
-                [self message:AIVL(@"نتيجة الاستعادة", @"Restore report") detail:message];
+                if (error || !report) {
+                    [self message:AIVL(@"تعذرت الاستعادة", @"Restore failed") detail:message];
+                } else {
+                    UIAlertController *done = [UIAlertController alertControllerWithTitle:
+                        AIVL(@"اكتملت عملية اللصق", @"Paste completed") message:message
+                        preferredStyle:UIAlertControllerStyleAlert];
+                    [done addAction:[UIAlertAction actionWithTitle:
+                        AIVL(@"إغلاق التطبيق لتطبيق الهوية", @"Close app to apply identity")
+                        style:UIAlertActionStyleDefault handler:^(__unused UIAlertAction *action) {
+                            // iOS provides no supported API to relaunch a re-signed app automatically.
+                            // Closing ensures cached UUID/session values are reloaded on next manual launch.
+                            exit(0);
+                        }]];
+                    [[self presenter] presentViewController:done animated:YES completion:nil];
+                }
             });
         });
     }]];
@@ -235,6 +269,7 @@ static NSString *AIVL(NSString *arabic, NSString *english) {
 __attribute__((constructor)) static void AIVBootstrap(void) {
     // Runs *inside* the host app when the library has been embedded and re-signed.
     // It does not gain jailbreak permissions or alter sandbox/Keychain entitlements.
+    AIVInstallIDFVOverride();
     dispatch_async(dispatch_get_main_queue(), ^{
         AIVOverlay *overlay = [AIVOverlay shared];
         [[NSNotificationCenter defaultCenter] addObserverForName:UIApplicationDidBecomeActiveNotification
