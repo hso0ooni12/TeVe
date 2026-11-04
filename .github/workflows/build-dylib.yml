@@ -32,7 +32,7 @@ jobs:
             -fobjc-arc -fmodules -O2 -Wall -Wextra \
             -dynamiclib \
             -install_name '@rpath/AppIdentityVault.dylib' \
-            src/AIVCrypto.m src/AIVArchive.m src/AppIdentityVault.m \
+            src/AIVCrypto.m src/AIVArchive.m src/AIVStream.m src/AppIdentityVault.m \
             -framework Foundation \
             -framework UIKit \
             -framework Security \

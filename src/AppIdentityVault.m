@@ -3,6 +3,7 @@
 #import <UniformTypeIdentifiers/UniformTypeIdentifiers.h>
 #import "AIVArchive.h"
 #import "AIVCrypto.h"
+#import "AIVStream.h"
 
 static NSString *AIVL(NSString *arabic, NSString *english) {
     NSString *lang = NSLocale.preferredLanguages.firstObject ?: @"en";
@@ -129,19 +130,16 @@ static NSString *AIVL(NSString *arabic, NSString *english) {
 - (void)createBackupWithPassword:(NSString *)password {
     dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
         NSError *error = nil;
-        NSDictionary *archive = [AIVArchive capture:&error];
-        NSData *plain = archive ? [NSPropertyListSerialization dataWithPropertyList:archive
-                            format:NSPropertyListBinaryFormat_v1_0 options:0 error:&error] : nil;
-        NSData *encrypted = plain ? [AIVCrypto encrypt:plain password:password error:&error] : nil;
         NSString *folder = [NSHomeDirectory() stringByAppendingPathComponent:@"Documents/AppIdentityVault"];
-        if (encrypted) [[NSFileManager defaultManager] createDirectoryAtPath:folder
+        [[NSFileManager defaultManager] createDirectoryAtPath:folder
             withIntermediateDirectories:YES attributes:nil error:&error];
         NSString *timestamp = [NSString stringWithFormat:@"%.0f", NSDate.date.timeIntervalSince1970];
         NSString *path = [folder stringByAppendingPathComponent:
                           [NSString stringWithFormat:@"AppIdentityVault-%@.aiv", timestamp]];
-        if (encrypted && !error && ![encrypted writeToFile:path options:NSDataWritingAtomic error:&error]) path = nil;
+        BOOL success = !error && [AIVStream createBackupAtURL:[NSURL fileURLWithPath:path]
+                                                      password:password error:&error];
         dispatch_async(dispatch_get_main_queue(), ^{
-            if (error || !encrypted || !path) {
+            if (error || !success) {
                 [self message:AIVL(@"فشل النسخ", @"Backup failed")
                          detail:error.localizedDescription ?: @"Unknown error"];
                 return;
@@ -171,13 +169,10 @@ static NSString *AIVL(NSString *arabic, NSString *english) {
                  detail:@"Choose an AppIdentityVault .aiv file."];
         return;
     }
-    NSError *readError = nil;
-    NSData *file = [NSData dataWithContentsOfURL:url options:NSDataReadingMappedIfSafe error:&readError];
-    if (!file) { [self message:@"Error" detail:readError.localizedDescription]; return; }
-    [self askRestorePasswordForData:file];
+    [self askRestorePasswordForURL:url];
 }
 
-- (void)askRestorePasswordForData:(NSData *)file {
+- (void)askRestorePasswordForURL:(NSURL *)url {
     UIAlertController *alert = [UIAlertController alertControllerWithTitle:AIVL(@"استعادة نسخة", @"Restore backup")
         message:AIVL(@"أدخل كلمة المرور لفك تشفير النسخة والتحقق منها.",
                      @"Enter the password to authenticate and decrypt this backup.")
@@ -192,24 +187,23 @@ static NSString *AIVL(NSString *arabic, NSString *english) {
         NSString *pass = alert.textFields.firstObject.text ?: @"";
         dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
             NSError *error = nil;
-            NSData *plain = [AIVCrypto decrypt:file password:pass error:&error];
-            NSDictionary *archive = plain ? [AIVArchive decode:plain error:&error] : nil;
+            NSDictionary *archive = [AIVStream previewAtURL:url password:pass error:&error];
             dispatch_async(dispatch_get_main_queue(), ^{
                 if (!archive) {
                     [self message:AIVL(@"تعذرت الاستعادة", @"Cannot restore")
                              detail:error.localizedDescription ?: @"Invalid archive"];
-                } else [self confirmRestore:archive];
+                } else [self confirmRestorePreview:archive URL:url password:pass];
             });
         });
     }]];
     [[self presenter] presentViewController:alert animated:YES completion:nil];
 }
 
-- (void)confirmRestore:(NSDictionary *)archive {
+- (void)confirmRestorePreview:(NSDictionary *)archive URL:(NSURL *)url password:(NSString *)password {
     NSString *detail = [NSString stringWithFormat:
         AIVL(@"النسخة: %@\nملفات: %lu — سجلات Keychain: %lu\nتحذيرات النسخ: %lu\n\nالاستعادة ستستبدل ملفات التطبيق الحالية، وقد تؤثر على تسجيل الدخول. هل أنت متأكد؟",
              @"Backup: %@\nFiles: %lu — Keychain records: %lu\nBackup warnings: %lu\n\nRestore overwrites current app files and may affect your login. Continue?"),
-        archive[@"created"] ?: @"?", (unsigned long)[archive[@"files"] count],
+        archive[@"created"] ?: @"?", (unsigned long)[archive[@"fileCount"] unsignedIntegerValue],
         (unsigned long)[archive[@"keychain"] count], (unsigned long)[archive[@"warnings"] count]];
     UIAlertController *alert = [UIAlertController alertControllerWithTitle:AIVL(@"تأكيد الاستعادة", @"Confirm restore")
                                                                 message:detail preferredStyle:UIAlertControllerStyleAlert];
@@ -218,14 +212,14 @@ static NSString *AIVL(NSString *arabic, NSString *english) {
                                              style:UIAlertActionStyleDestructive handler:^(__unused UIAlertAction *action) {
         dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
             NSError *error = nil;
-            NSDictionary *report = [AIVArchive restore:archive error:&error];
+            NSDictionary *report = [AIVStream restoreAtURL:url password:password error:&error];
             dispatch_async(dispatch_get_main_queue(), ^{
                 NSUInteger issues = [report[@"warnings"] count];
                 NSString *message = error.localizedDescription ?: [NSString stringWithFormat:
                     AIVL(@"تمت استعادة %@ ملف و%@ سجل Keychain. FCUUID: %@. تحذيرات: %lu. أغلق التطبيق بالكامل وافتحه لفحص الحساب.",
                          @"Restored %@ files and %@ Keychain records. FCUUID: %@. Warnings: %lu. Force close and reopen to check the account."),
-                    report[@"files"] ?: @0, report[@"keychain"] ?: @0,
-                    [report[@"fcUUID"] boolValue] ? AIVL(@"نعم", @"yes") : AIVL(@"غير متاح", @"unavailable"),
+                    report[@"files"] ?: @0, report[@"keychainRestored"] ?: @0,
+                    [report[@"fcUUIDRestored"] boolValue] ? AIVL(@"نعم", @"yes") : AIVL(@"غير متاح", @"unavailable"),
                     (unsigned long)issues];
                 if (issues) message = [message stringByAppendingFormat:@"\n%@",
                                      [[report[@"warnings"] subarrayWithRange:NSMakeRange(0, MIN(issues, 3))] componentsJoinedByString:@"\n"]];

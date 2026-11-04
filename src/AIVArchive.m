@@ -180,6 +180,77 @@ static BOOL AIVPathHasSymlink(NSURL *destination) {
 
 @implementation AIVArchive
 
++ (NSArray<NSDictionary *> *)fileDescriptors:(NSError **)error {
+    NSFileManager *fm = NSFileManager.defaultManager;
+    NSMutableArray<NSDictionary *> *descriptors = [NSMutableArray array];
+    NSMutableDictionary<NSString *, NSURL *> *roots = [NSMutableDictionary dictionary];
+    NSString *home = NSHomeDirectory();
+    for (NSString *folder in @[@"Documents", @"Library"]) {
+        NSURL *root = [NSURL fileURLWithPath:[home stringByAppendingPathComponent:folder]];
+        if ([fm fileExistsAtPath:root.path]) roots[[@"app/" stringByAppendingString:folder]] = root;
+    }
+    for (NSString *group in AIVAppGroups()) {
+        NSURL *root = [fm containerURLForSecurityApplicationGroupIdentifier:group];
+        if (root) roots[[@"group/" stringByAppendingString:group]] = root;
+    }
+    NSArray *keys = @[NSURLIsRegularFileKey, NSURLIsSymbolicLinkKey, NSURLFileSizeKey];
+    for (NSString *prefix in roots) {
+        NSURL *root = roots[prefix];
+        __block NSError *enumerationError = nil;
+        NSDirectoryEnumerator *it = [fm enumeratorAtURL:root includingPropertiesForKeys:keys
+                 options:NSDirectoryEnumerationSkipsHiddenFiles
+            errorHandler:^BOOL(__unused NSURL *url, NSError *fileError) {
+                enumerationError = fileError;
+                return NO;
+            }];
+        for (NSURL *url in it) {
+            NSString *relative = [url.path substringFromIndex:root.path.length + 1];
+            if ([relative isEqualToString:@"AppIdentityVault"] ||
+                [relative hasPrefix:@"AppIdentityVault/"] ||
+                [relative isEqualToString:@"Caches"] ||
+                [relative hasPrefix:@"Caches/"] ||
+                [relative isEqualToString:@"SplashBoard"] ||
+                [relative hasPrefix:@"SplashBoard/"]) {
+                [it skipDescendants];
+                continue;
+            }
+            NSNumber *regular = nil, *link = nil, *size = nil;
+            [url getResourceValue:&regular forKey:NSURLIsRegularFileKey error:NULL];
+            [url getResourceValue:&link forKey:NSURLIsSymbolicLinkKey error:NULL];
+            [url getResourceValue:&size forKey:NSURLFileSizeKey error:NULL];
+            if (!regular.boolValue || link.boolValue) continue;
+            [descriptors addObject:@{@"url":url,
+                                    @"path":[prefix stringByAppendingFormat:@"/%@", relative],
+                                    @"size":size ?: @0}];
+        }
+        if (enumerationError) {
+            if (error) *error = enumerationError;
+            return nil;
+        }
+    }
+    return descriptors;
+}
+
++ (NSDictionary *)captureMetadata {
+    NSMutableArray<NSString *> *warnings = [NSMutableArray array];
+    NSArray *keychain = AIVKeychainSnapshot(warnings);
+    NSUserDefaults *prefs = NSUserDefaults.standardUserDefaults;
+    return @{@"format":@2,
+             @"bundleID":NSBundle.mainBundle.bundleIdentifier ?: @"",
+             @"appVersion":[NSBundle.mainBundle objectForInfoDictionaryKey:@"CFBundleShortVersionString"] ?: @"",
+             @"created":[NSDate date],
+             @"sourceIDFV":UIDevice.currentDevice.identifierForVendor.UUIDString ?: @"",
+             @"fcUUID":[prefs stringForKey:@"fc_uuidForDevice"] ?: @"",
+             @"groupIDs":AIVAppGroups(),
+             @"keychain":keychain,
+             @"warnings":warnings};
+}
+
++ (NSURL *)restoreDestinationForPath:(NSString *)path {
+    NSURL *url = AIVRestoreURL(path);
+    return url && !AIVPathHasSymlink(url) ? url : nil;
+}
+
 + (NSDictionary *)capture:(NSError **)error {
     NSFileManager *fm = NSFileManager.defaultManager;
     NSString *home = NSHomeDirectory();
