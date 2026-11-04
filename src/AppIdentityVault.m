@@ -86,74 +86,16 @@ static NSString *AIVL(NSString *arabic, NSString *english) {
     UIViewController *controller = [self presenter];
     if (!controller) return;
     UIAlertController *sheet = [UIAlertController alertControllerWithTitle:@"App Identity Vault"
-            message:AIVL(@"نسخ محلي مشفر. لا يمكن نقل هوية الجهاز المحمية أو ضمان قبول الجلسة من السيرفر.",
-                         @"Encrypted local backup. Hardware identity and server sessions cannot be guaranteed.")
-            preferredStyle:UIAlertControllerStyleActionSheet];
-    [sheet addAction:[UIAlertAction actionWithTitle:AIVL(@"نسخ الحالة وتصديرها", @"Back up and export")
+            message:AIVL(@"اختر عملية واحدة. كل عملية تشمل الملفات وKeychain وApp Groups والمعرّفات الممكنة تلقائيًا.",
+                         @"Choose an action. Each action includes accessible files, Keychain, App Groups, and identifiers automatically.")
+            preferredStyle:UIAlertControllerStyleAlert];
+    [sheet addAction:[UIAlertAction actionWithTitle:AIVL(@"نسخ الهوية", @"Copy identity")
                                               style:UIAlertActionStyleDefault
                                             handler:^(__unused UIAlertAction *action) { [self askBackupPassword]; }]];
-    [sheet addAction:[UIAlertAction actionWithTitle:AIVL(@"استعادة ملف نسخة", @"Restore a backup")
+    [sheet addAction:[UIAlertAction actionWithTitle:AIVL(@"لصق الهوية", @"Paste identity")
                                               style:UIAlertActionStyleDefault
                                             handler:^(__unused UIAlertAction *action) { [self chooseBackup]; }]];
-    [sheet addAction:[UIAlertAction actionWithTitle:AIVL(@"نسخ UUID الظاهر", @"Copy visible UUID")
-                                              style:UIAlertActionStyleDefault
-                                            handler:^(__unused UIAlertAction *action) { [self copyUUID]; }]];
-    [sheet addAction:[UIAlertAction actionWithTitle:AIVL(@"إدخال FCUUID تجريبي", @"Set FCUUID (experimental)")
-                                              style:UIAlertActionStyleDefault
-                                            handler:^(__unused UIAlertAction *action) { [self askFCUUID]; }]];
-    [sheet addAction:[UIAlertAction actionWithTitle:AIVL(@"إلغاء", @"Cancel")
-                                              style:UIAlertActionStyleCancel handler:nil]];
-    UIPopoverPresentationController *popover = sheet.popoverPresentationController;
-    if (popover) { popover.sourceView = self.floatingButton; popover.sourceRect = self.floatingButton.bounds; }
     [controller presentViewController:sheet animated:YES completion:nil];
-}
-
-- (void)copyUUID {
-    NSUserDefaults *prefs = NSUserDefaults.standardUserDefaults;
-    NSString *uuid = [prefs stringForKey:@"fc_uuidForDevice"];
-    NSString *source = @"fc_uuidForDevice";
-    if (!uuid.length) {
-        uuid = UIDevice.currentDevice.identifierForVendor.UUIDString;
-        source = @"identifierForVendor";
-    }
-    if (!uuid.length) {
-        [self message:@"UUID" detail:AIVL(@"المعرّف غير متاح.", @"No UUID is available.")];
-        return;
-    }
-    UIPasteboard.generalPasteboard.string = uuid;
-    [self message:AIVL(@"تم النسخ", @"Copied")
-             detail:[NSString stringWithFormat:@"%@: %@\n%@", source, uuid,
-                     AIVL(@"هذا معرّف واحد وليس نسخة كاملة من الحساب.",
-                          @"This is one identifier, not a complete account backup.")]];
-}
-
-- (void)askFCUUID {
-    UIAlertController *alert = [UIAlertController alertControllerWithTitle:@"FCUUID"
-        message:AIVL(@"يغيّر fc_uuidForDevice في تفضيلات التطبيق فقط. قد يفضّل التطبيق قيمة Keychain ولن تتغيّر هوية Apple العتادية.",
-                     @"Changes only fc_uuidForDevice in app preferences. Keychain may take precedence; Apple hardware identity is unchanged.")
-        preferredStyle:UIAlertControllerStyleAlert];
-    [alert addTextFieldWithConfigurationHandler:^(UITextField *field) {
-        field.placeholder = @"32 hex / standard UUID";
-        field.text = [NSUserDefaults.standardUserDefaults stringForKey:@"fc_uuidForDevice"];
-        field.autocapitalizationType = UITextAutocapitalizationTypeNone;
-    }];
-    [alert addAction:[UIAlertAction actionWithTitle:AIVL(@"إلغاء", @"Cancel")
-                                             style:UIAlertActionStyleCancel handler:nil]];
-    [alert addAction:[UIAlertAction actionWithTitle:AIVL(@"حفظ", @"Save")
-                                             style:UIAlertActionStyleDefault handler:^(__unused UIAlertAction *a) {
-        NSString *uuid = [alert.textFields.firstObject.text stringByTrimmingCharactersInSet:NSCharacterSet.whitespaceAndNewlineCharacterSet];
-        NSPredicate *p = [NSPredicate predicateWithFormat:@"SELF MATCHES[c] %@",
-                          @"([0-9a-f]{32}|[0-9a-f]{8}(-[0-9a-f]{4}){3}-[0-9a-f]{12})"];
-        if (![p evaluateWithObject:uuid ?: @""]) {
-            [self message:@"UUID" detail:AIVL(@"صيغة المعرّف غير صحيحة.", @"Invalid UUID format.")];
-            return;
-        }
-        [NSUserDefaults.standardUserDefaults setObject:uuid forKey:@"fc_uuidForDevice"];
-        [self message:AIVL(@"تم حفظ FCUUID", @"FCUUID saved")
-                 detail:AIVL(@"أغلق التطبيق وافتحه. قد تحتاج استعادة Keychain والملفات أيضًا.",
-                              @"Close and reopen the app. Keychain and file restore may also be required.")];
-    }]];
-    [[self presenter] presentViewController:alert animated:YES completion:nil];
 }
 
 - (void)askBackupPassword {
@@ -280,9 +222,11 @@ static NSString *AIVL(NSString *arabic, NSString *english) {
             dispatch_async(dispatch_get_main_queue(), ^{
                 NSUInteger issues = [report[@"warnings"] count];
                 NSString *message = error.localizedDescription ?: [NSString stringWithFormat:
-                    AIVL(@"تمت استعادة %@ ملف و%@ سجل Keychain. تحذيرات: %lu. أغلق التطبيق بالكامل وافتحه لفحص الحساب.",
-                         @"Restored %@ files and %@ Keychain records. Warnings: %lu. Force close and reopen to check the account."),
-                    report[@"files"] ?: @0, report[@"keychain"] ?: @0, (unsigned long)issues];
+                    AIVL(@"تمت استعادة %@ ملف و%@ سجل Keychain. FCUUID: %@. تحذيرات: %lu. أغلق التطبيق بالكامل وافتحه لفحص الحساب.",
+                         @"Restored %@ files and %@ Keychain records. FCUUID: %@. Warnings: %lu. Force close and reopen to check the account."),
+                    report[@"files"] ?: @0, report[@"keychain"] ?: @0,
+                    [report[@"fcUUID"] boolValue] ? AIVL(@"نعم", @"yes") : AIVL(@"غير متاح", @"unavailable"),
+                    (unsigned long)issues];
                 if (issues) message = [message stringByAppendingFormat:@"\n%@",
                                      [[report[@"warnings"] subarrayWithRange:NSMakeRange(0, MIN(issues, 3))] componentsJoinedByString:@"\n"]];
                 [self message:AIVL(@"نتيجة الاستعادة", @"Restore report") detail:message];
