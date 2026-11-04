@@ -132,7 +132,12 @@ static void AIVInstallIDFVOverride(void) {
         message:AIVL(@"انتظر شوي. لا تقفل التطبيق لين يكتمل الحفظ.",
                      @"Please keep the app open while its data is copied.")
         preferredStyle:UIAlertControllerStyleAlert];
-    [controller presentViewController:progress animated:YES completion:^{
+    [controller presentViewController:progress animated:YES completion:nil];
+    // Never make the actual backup depend on a modal presentation completion.
+    // Some host apps block/delay presentation, which previously appeared as a
+    // tap that did nothing at all.
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.2 * NSEC_PER_SEC)),
+                   dispatch_get_main_queue(), ^{
       dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
         NSError *error = nil;
         NSString *folder = [NSHomeDirectory() stringByAppendingPathComponent:@"Documents/AppIdentityVault"];
@@ -150,7 +155,7 @@ static void AIVInstallIDFVOverride(void) {
             success = size.unsignedLongLongValue > 36 && !error;
         }
         dispatch_async(dispatch_get_main_queue(), ^{
-            [progress dismissViewControllerAnimated:YES completion:^{
+            void (^showResult)(void) = ^{
                 if (!success) {
                     [self message:AIVL(@"فشل النسخ", @"Backup failed")
                              detail:error.localizedDescription ?: AIVL(@"تعذر إنشاء الملف. تحقق من المساحة المتوفرة.",
@@ -158,10 +163,15 @@ static void AIVInstallIDFVOverride(void) {
                 } else {
                     [self showBackupReady:[NSURL fileURLWithPath:path] size:size];
                 }
-            }];
+            };
+            if (progress.presentingViewController) {
+                [progress dismissViewControllerAnimated:YES completion:showResult];
+            } else {
+                showResult();
+            }
         });
       });
-    }];
+    });
 }
 
 - (void)showBackupReady:(NSURL *)file size:(NSNumber *)size {
