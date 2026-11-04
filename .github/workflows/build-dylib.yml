@@ -1,0 +1,54 @@
+name: Build AppIdentityVault dylib
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [master, main]
+    paths:
+      - "src/**"
+      - ".github/workflows/build-dylib.yml"
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: macos-latest
+    timeout-minutes: 20
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+
+      - name: Compile iOS arm64 dylib
+        shell: bash
+        run: |
+          set -euo pipefail
+          SDK="$(xcrun --sdk iphoneos --show-sdk-path)"
+          mkdir -p build
+          xcrun --sdk iphoneos clang \
+            -arch arm64 \
+            -isysroot "$SDK" \
+            -miphoneos-version-min=15.0 \
+            -fobjc-arc -fmodules -O2 -Wall -Wextra \
+            -dynamiclib \
+            -install_name '@rpath/AppIdentityVault.dylib' \
+            src/AIVCrypto.m src/AIVArchive.m src/AppIdentityVault.m \
+            -framework Foundation \
+            -framework UIKit \
+            -framework Security \
+            -framework UniformTypeIdentifiers \
+            -framework CoreGraphics \
+            -o build/AppIdentityVault.dylib
+          codesign --force --sign - build/AppIdentityVault.dylib
+          file build/AppIdentityVault.dylib
+          shasum -a 256 build/AppIdentityVault.dylib > build/SHA256.txt
+
+      - name: Publish binary artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: AppIdentityVault-arm64-dylib
+          path: |
+            build/AppIdentityVault.dylib
+            build/SHA256.txt
+          if-no-files-found: error
+          retention-days: 30

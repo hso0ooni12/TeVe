@@ -1,80 +1,62 @@
-![](TeVe.png)
-<h1 align="center">
-A Free IPtv Player
-</h1>
+# App Identity Vault — injected iOS `.dylib` (alpha)
 
+نسخة أولية مفتوحة المصدر لأخذ نسخة **محلية ومشفرة** من بيانات التطبيق المتاحة له ثم استعادتها لاحقًا، من داخل تطبيق iOS محقون بملف `.dylib` وموقّع من جديد.
 
-# 📺 **TeVe** ![license](https://img.shields.io/github/license/7-USH/Heart-Rate-Monitor)
+> **مهم جدًا:** هذه الأداة **ليست** وسيلة مضمونة لنسخ «هوية الجهاز كاملة». لن تتجاوز قيود Apple على Keychain وSecure Enclave وApp Attest، ولن تسترجع حسابًا أو محادثة حذفهما السيرفر. لم تُختبر مع يودل على جهاز حقيقي.
 
-A cross platform **IPTv player** developed for Android/IOS.
+## الميزات الفعلية في النسخة الأولى
 
-You can watch and add channels to your favorite list from all around the globe. You can access channels according to your preference of choice or based upon your country. 
+- زر عائم `IV` داخل التطبيق، بواجهة عربية أو إنجليزية حسب لغة الجهاز.
+- تصدير ملف `.aiv` مشفر بكلمة مرور (AES‑256‑CBC + HMAC‑SHA‑256، وPBKDF2‑SHA‑256 بمقدار 220,000 دورة).
+- نسخ ملفات `Documents` و`Library`، باستثناء `Caches` والنسخ الاحتياطية التي أنشأتها الأداة نفسها.
+- محاولة نسخ حاويات `App Groups` التي يصرّح توقيع التطبيق بالوصول إليها.
+- محاولة نسخ العناصر *القابلة للتصدير والمتاحة لعملية التطبيق* من Keychain (خمسة أصناف)؛ بعض العناصر/المفاتيح لا تسمح Apple بتصديرها.
+- استيراد ملف `.aiv`، التأكد من سلامته وكلمة مروره ومطابقة `Bundle ID`، ثم تأكيد منفصل قبل استبدال الملفات الحالية.
+- نسخ UUID المعروض، وإمكانية ضبط `fc_uuidForDevice` في تفضيلات التطبيق **تجريبيًا**؛ لا يغيّر هذا تلقائيًا `identifierForVendor` أو هوية الجهاز.
 
-This app contains roughly [10,000 channels](https://iptv-org.github.io/iptv/channels.json) that are freely available to watch. 
+### حدود النسخة الأولى
 
-## **Overview**
+- **96 ميجابايت** حد أقصى لمحتوى الملفات؛ **32 ميجابايت** لكل ملف. إذا تجاوز التطبيق الحد، يتوقف النسخ ويُظهر خطأ، ولا ينشئ نسخة ناقصة بصمت.
+- ملفات الكاش والمجلد المؤقت `tmp` لا تدخل في النسخة.
+- تؤخذ النسخة والتطبيق يعمل، ولذلك قد تكون قواعد بيانات SQLite التي يكتب إليها التطبيق لحظيًا غير متسقة. يُفضّل إيقاف نشاط التطبيق قبل النسخ، وتجربة الاستعادة على نسخة اختبارية أولًا.
+- قد تفشل استعادة Keychain بسبب اختلاف فريق التوقيع (`Team ID`) أو `Access Groups`، حتى إن كان `Bundle ID` نفسه.
+- لا يستعيد هذا المشروع معرفات الجهاز العتادية أو مفاتيح Secure Enclave أو تسجيلات App Attest أو صلاحيات لم يمنحها توقيع التطبيق.
+- الاستعادة تستبدل الملفات الموجودة في مسارات النسخة. خذ نسخة من الحالة الحالية قبل تنفيذها.
+- ملفات `.aiv` قد تحتوي على بيانات حساسة؛ **احفظها وكلمة المرور في مكانين آمنين، ولا تشاركها مع أي شخص**.
+- النسخة **Alpha**: لم يُجرَ اختبار بناء Xcode ولا اختبار تشغيل على آيفون ضمن هذه البيئة. يجب اختبارها قبل الاعتماد عليها لمنع فقد البيانات.
 
-The app uses the [IPTV API](https://iptv-org.github.io) as a data sources and uses the standard dart libraries for making network requests.
+## كيف تنتج ملف dylib من GitHub Actions دون ماك؟
 
-In terms of UI, the goal was replicating the Android design as closely as possible to understand the possibilities that Flutter offers for crafting UIs.
+1. ضع محتويات هذا المجلد في **جذر مستودع GitHub جديد** (تأكد أن `.github/workflows/build-dylib.yml` موجودة).
+2. افتح قسم **Actions** ثم اختر **Build AppIdentityVault dylib**.
+3. اضغط **Run workflow**.
+4. بعد نجاح البناء، افتح التشغيل ثم **Artifacts** وحمّل `AppIdentityVault-arm64-dylib`.
+5. ستجد `AppIdentityVault.dylib` وملف بصمة `SHA256.txt`.
 
-## **Screenshots**
-Login | SignUp
----|---
-<img src="ss/ss_1.png" style="margin-right: 20px" alt="drawing" width="200"/> | <img src="ss/ss_3.png" style="margin-right: 20px" alt="drawing" width="200"/>
-<br />
+الملف مبني `arm64`، للاستخدام مع التطبيقات التي تتيح أداة التوقيع حقن المكتبة وإعادة توقيع التطبيق كاملاً بشكل صحيح. التوقيع وإعادة التغليف مسؤولية الأداة المستخدمة.
 
-Home |
----|
-<img src="ss/ss_4.png" style="margin-right: 20px" alt="drawing" width="420"/> 
-<img src="ss/ss_6.png" style="margin-right: 20px" alt="drawing" width="420"/>  
-<br />
+## طريقة الاستخدام داخل تطبيقك
 
-Favorite's Page |
----|
-<img src="ss/ss_7.png" style="margin-right: 20px" alt="drawing" width="420"/>
-<br />
+1. احقن `AppIdentityVault.dylib` في نسخة التطبيق المسموح لك تعديلها، ثم وقّع الـIPA بالطريقة المعتادة.
+2. افتح التطبيق، سيظهر زر صغير يحمل الحرفين `IV`.
+3. اختر **نسخ الحالة وتصديرها**، وأدخل كلمة مرور قوية مرتين.
+4. احفظ ملف `.aiv` عبر نافذة الملفات إلى مكان **خارج الجهاز** قبل الفورمات.
+5. عند الاستعادة: ثبّت نفس التطبيق وتوقيعه المتوافق، واحقن المكتبة، ثم **استعادة ملف نسخة**.
+6. أدخل كلمة المرور، راجع عدد الملفات وسجلات Keychain، وأكّد الاستعادة.
+7. أغلق التطبيق بالكامل وافتحه من جديد؛ تحقق من الحساب والمحادات بنفسك.
 
-Channel Page |
----|
-<img src="ss/ss_2.png" style="margin-right: 20px" alt="drawing" width="420"/>
+> تغيير شهادة التوقيع من مطوّر إلى آخر قد يغير صلاحيات Keychain. وجود `.dylib` داخل IPA لا يجعل التطبيق مجلبرك، ولا يتيح قراءة بيانات تطبيق App Store الأصلي بشكل عام.
 
-## **Requirements**
-- Any Operating System (i.e. MacOS X, Linux, Window)
-- Any IDE with Flutter SDK installed (i.e. IntelliJ, Android Studio, VSCode etc)
-- Knowledge about Dart and Flutter
+## التحقق من المشروع
 
-## **Features**
+- [ ] بناء macOS باستخدام iOS SDK ينجح.
+- [ ] زر IV يظهر في التطبيق المستهدف.
+- [ ] تصدير نسخة وتجربة استعادتها على تطبيق اختبار دون بيانات مهمة.
+- [ ] اختبار كلمة مرور خاطئة وملف تالف.
+- [ ] اختبار تطبيق بملفات كبيرة وApp Groups.
+- [ ] مقارنة صلاحيات Team ID وKeychain قبل وبعد إعادة التوقيع.
+- [ ] **فحص مستقل** قبل تجربة أي محادثات أو حسابات مهمة.
 
-- [x] Login
-- [x] Sign Up
-- [x] View Live Stream
-- [x] Add to Favorites
-- [x] Sort by Country
+## الخصوصية
 
-## **API Reference**
-
-> API used : https://iptv-org.github.io
-
-#### Get all channels
-
-```
-  GET /api/channels.json
-```
-
-| Parameter | Type   | Response           |
-| :-------- | :----- | :----------------- |
-| `none`    | `none` | `List of Channels` |
-
-## **Backend**
-
-Backend was developed using fast API and Sqlite
-
-> API used : https://web-7-ush.cloud.okteto.net
-
-Check following repository to know more about [**Teve-Backend**](https://github.com/7-USH/Teve-Backend).
-
-## **Credits**
-
-- [IPTVify App Ui Design](https://dribbble.com/shots/14754204-IPTVify-App-Ui-Design)
-- [IPTV Github Repository](https://github.com/iptv-org/iptv)
+لا توجد طلبات شبكة أو تحليلات أو خادم في الكود. كل التصدير والاستيراد يحدث محليًا بإجراء صريح من المستخدم. نوصي بمراجعة المصدر قبل حقنه في تطبيق يحتوي على بيانات مهمة.
