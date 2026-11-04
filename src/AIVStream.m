@@ -67,8 +67,13 @@ static NSURL *AIVSQLiteSnapshot(NSURL *sourceURL, NSURL *directory, NSError **er
     }
     if (backup) {
         NSUInteger retries = 0;
+        CFAbsoluteTime started = CFAbsoluteTimeGetCurrent();
         do {
             result = sqlite3_backup_step(backup, 128);
+            if (CFAbsoluteTimeGetCurrent() - started > 90.0) {
+                result = SQLITE_ABORT; // Never allow one busy DB to freeze backup indefinitely.
+                break;
+            }
             if (result == SQLITE_BUSY || result == SQLITE_LOCKED) {
                 if (++retries > 30) break;
                 sqlite3_sleep(100);
@@ -493,9 +498,10 @@ static NSDictionary *AIVParse(id<AIVRecordReader> reader, BOOL restore, NSError 
                              options:NSPropertyListImmutable format:NULL error:error];
             if (![m isKindOfClass:NSDictionary.class] ||
                 ![m[@"format"] isEqual:@2] ||
+                ![m[@"identityOnly"] isEqual:@YES] ||
                 ![m[@"bundleID"] isEqualToString:NSBundle.mainBundle.bundleIdentifier ?: @""] ||
                 ![m[@"keychain"] isKindOfClass:NSArray.class]) {
-                if (error) *error = AIVSErr(23, @"Wrong app or invalid backup manifest.");
+                if (error) *error = AIVSErr(23, @"Wrong app, legacy full-data backup, or invalid identity file.");
                 return nil;
             }
             manifest = m;
@@ -593,10 +599,14 @@ static NSDictionary *AIVParse(id<AIVRecordReader> reader, BOOL restore, NSError 
 
 @implementation AIVStream
 
-+ (BOOL)createBackupAtURL:(NSURL *)url error:(NSError **)error {
++ (BOOL)createBackupAtURL:(NSURL *)url
+                  progress:(void (^)(NSString *stage))progress
+                     error:(NSError **)error {
+    if (progress) progress(@"Scanning app files");
     NSMutableArray<NSString *> *scanWarnings = [NSMutableArray array];
     NSArray<NSDictionary *> *descriptors = [AIVArchive fileDescriptorsWithWarnings:scanWarnings error:error];
     if (!descriptors) return NO;
+    if (progress) progress(@"Reading app metadata and Keychain");
     NSMutableDictionary *metadata = [[AIVArchive captureMetadata] mutableCopy];
     [scanWarnings addObjectsFromArray:metadata[@"warnings"] ?: @[]];
     metadata[@"warnings"] = scanWarnings;
@@ -617,10 +627,16 @@ static NSDictionary *AIVParse(id<AIVRecordReader> reader, BOOL restore, NSError 
     }
     NSMutableArray<NSString *> *lateWarnings = [NSMutableArray array];
     BOOL ok = AIVWriteRecord(writer, 1, @"", plist, error);
+    NSUInteger fileIndex = 0;
     for (NSDictionary *entry in descriptors) {
         if (!ok) break;
+        @autoreleasepool {
+        ++fileIndex;
         NSURL *fileURL = entry[@"url"];
         NSString *path = entry[@"path"];
+        if (progress && (fileIndex == 1 || fileIndex % 20 == 0))
+            progress([NSString stringWithFormat:@"Copying file %lu/%lu: %@",
+                      (unsigned long)fileIndex, (unsigned long)descriptors.count, path]);
         NSData *pathData = [path dataUsingEncoding:NSUTF8StringEncoding];
         if (!pathData.length || pathData.length > 4096) {
             if (error) *error = AIVSErr(25, @"App file path is too long.");
@@ -640,6 +656,8 @@ static NSDictionary *AIVParse(id<AIVRecordReader> reader, BOOL restore, NSError 
         }
         NSURL *sqliteCopy = nil;
         if (AIVHasSQLiteHeader(input)) {
+            if (progress) progress([NSString stringWithFormat:@"Snapshotting SQLite file %lu/%lu: %@",
+                                    (unsigned long)fileIndex, (unsigned long)descriptors.count, path]);
             [input closeFile];
             sqliteCopy = AIVSQLiteSnapshot(fileURL, snapshotDirectory, error);
             if (!sqliteCopy) { ok = NO; break; }
@@ -652,20 +670,36 @@ static NSDictionary *AIVParse(id<AIVRecordReader> reader, BOOL restore, NSError 
             [input closeFile]; ok = NO; break;
         }
         uint64_t currentSize = (uint64_t)attributes.st_size;
+        if (currentSize > 2ULL * 1024ULL * 1024ULL) {
+            [input closeFile];
+            [lateWarnings addObject:[NSString stringWithFormat:@"Core identity file grew too large; skipped: %@", path]];
+            continue;
+        }
         ok = [writer append:AIVRecordHeader(2, (uint32_t)pathData.length,
                                             currentSize) error:error] &&
              [writer append:pathData error:error];
         uint64_t left = currentSize;
+        uint64_t lastProgress = 0;
         while (ok && left) {
-            NSData *chunk = [input readDataOfLength:(NSUInteger)MIN((uint64_t)AIVChunk, left)];
-            if (!chunk.length) {
-                if (error) *error = AIVSErr(26, @"A file changed during backup. Try again after closing app activity.");
-                ok = NO; break;
+            @autoreleasepool {
+                NSData *chunk = [input readDataOfLength:(NSUInteger)MIN((uint64_t)AIVChunk, left)];
+                if (!chunk.length) {
+                    if (error) *error = AIVSErr(26, @"A file changed during backup. Try again after closing app activity.");
+                    ok = NO;
+                } else {
+                    ok = [writer append:chunk error:error];
+                    left -= chunk.length;
+                }
             }
-            ok = [writer append:chunk error:error];
-            left -= chunk.length;
+            if (progress && currentSize - left - lastProgress >= 16ULL * 1024ULL * 1024ULL) {
+                lastProgress = currentSize - left;
+                progress([NSString stringWithFormat:@"Copying file %lu/%lu (%llu MiB): %@",
+                          (unsigned long)fileIndex, (unsigned long)descriptors.count,
+                          (unsigned long long)(lastProgress / 1048576ULL), path]);
+            }
         }
         [input closeFile];
+        } // End per-file autorelease pool (keeps huge app backups memory bounded).
     }
     if (ok && lateWarnings.count) {
         NSData *warningPlist = [NSPropertyListSerialization dataWithPropertyList:lateWarnings
@@ -673,11 +707,13 @@ static NSDictionary *AIVParse(id<AIVRecordReader> reader, BOOL restore, NSError 
         ok = warningPlist && AIVWriteRecord(writer, 3, @"", warningPlist, error);
     }
     if (ok) ok = [writer append:AIVRecordHeader(0, 0, 0) error:error];
+    if (progress) progress(@"Finalizing backup file");
     if (ok) ok = [writer finish:error];
     writer = nil;
     if (ok) ok = [[NSFileManager defaultManager] moveItemAtURL:partial toURL:url error:error];
     if (!ok) [[NSFileManager defaultManager] removeItemAtURL:partial error:NULL];
     [NSFileManager.defaultManager removeItemAtURL:snapshotDirectory error:NULL];
+    if (ok && progress) progress(@"Backup completed");
     return ok;
 }
 

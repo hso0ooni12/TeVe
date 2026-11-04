@@ -2,6 +2,7 @@
 #import <Security/Security.h>
 #import <UIKit/UIKit.h>
 #import <dlfcn.h>
+#import <objc/message.h>
 
 static NSString *const AIVArchiveDomain = @"com.appidentityvault.archive";
 // Intentional memory bound for the first release. Larger apps need a streaming archive.
@@ -15,6 +16,11 @@ static NSError *AIVError(NSInteger code, NSString *description) {
 
 static id AIVSafePlistValue(id value) {
     if (!value || value == (id)kCFNull) return nil;
+    // Keep identifiers and tokens; leave out image-sized values in preferences.
+    if ([value isKindOfClass:NSData.class] && [value length] > 256 * 1024) return nil;
+    if ([value isKindOfClass:NSString.class] && [value length] > 256 * 1024) return nil;
+    if ([value isKindOfClass:NSArray.class] && [value count] > 4096) return nil;
+    if ([value isKindOfClass:NSDictionary.class] && [value count] > 4096) return nil;
     if ([value isKindOfClass:NSString.class] ||
         [value isKindOfClass:NSNumber.class] ||
         [value isKindOfClass:NSData.class] ||
@@ -178,6 +184,20 @@ static BOOL AIVPathHasSymlink(NSURL *destination) {
     return NO;
 }
 
+static BOOL AIVLikelyIdentityFile(NSString *relative) {
+    NSString *name = relative.lastPathComponent.lowercaseString;
+    NSString *extension = name.pathExtension;
+    if (![@[@"plist", @"json", @"db", @"sqlite", @"sqlite3", @"dat", @"txt", @"bin", @""]
+          containsObject:extension]) return NO;
+    for (NSString *part in @[@"auth", @"identity", @"session", @"token", @"credential",
+                             @"install", @"uuid", @"idfv", @"deviceid", @"userid",
+                             @"user-id", @"account", @"firebase", @"keychain",
+                             @"settings", @"config", @"persist", @"profile", @"storage"]) {
+        if ([name containsString:part]) return YES;
+    }
+    return NO;
+}
+
 @implementation AIVArchive
 
 + (NSArray<NSDictionary *> *)fileDescriptorsWithWarnings:(NSMutableArray<NSString *> *)warnings
@@ -186,15 +206,26 @@ static BOOL AIVPathHasSymlink(NSURL *destination) {
     NSMutableArray<NSDictionary *> *descriptors = [NSMutableArray array];
     NSMutableDictionary<NSString *, NSURL *> *roots = [NSMutableDictionary dictionary];
     NSString *home = NSHomeDirectory();
-    for (NSString *folder in @[@"Documents", @"Library"]) {
+    // Identity-only: scan preference/config folders, never media, Caches,
+    // Documents, general databases, or full application storage.
+    NSArray *identityFolders = @[@"Library/Preferences", @"Library/Application Support"];
+    for (NSString *folder in identityFolders) {
         NSURL *root = [NSURL fileURLWithPath:[home stringByAppendingPathComponent:folder]];
         if ([fm fileExistsAtPath:root.path]) roots[[@"app/" stringByAppendingString:folder]] = root;
     }
     for (NSString *group in AIVAppGroups()) {
-        NSURL *root = [fm containerURLForSecurityApplicationGroupIdentifier:group];
-        if (root) roots[[@"group/" stringByAppendingString:group]] = root;
+        NSURL *groupRoot = [fm containerURLForSecurityApplicationGroupIdentifier:group];
+        if (!groupRoot) continue;
+        for (NSString *folder in identityFolders) {
+            NSURL *root = [groupRoot URLByAppendingPathComponent:folder];
+            if ([fm fileExistsAtPath:root.path])
+                roots[[NSString stringWithFormat:@"group/%@/%@", group, folder]] = root;
+        }
     }
     NSArray *keys = @[NSURLIsRegularFileKey, NSURLIsSymbolicLinkKey, NSURLFileSizeKey];
+    unsigned long long totalSelected = 0;
+    const unsigned long long maxFile = 2ULL * 1024ULL * 1024ULL;
+    const unsigned long long maxTotal = 16ULL * 1024ULL * 1024ULL;
     for (NSString *prefix in roots) {
         NSURL *root = roots[prefix];
         __block NSError *enumerationError = nil;
@@ -211,6 +242,7 @@ static BOOL AIVPathHasSymlink(NSURL *destination) {
                 return NO;
             }];
         for (NSURL *url in it) {
+            @autoreleasepool {
             NSString *relative = [url.path substringFromIndex:root.path.length + 1];
             if ([relative isEqualToString:@"AppIdentityVault"] ||
                 [relative hasPrefix:@"AppIdentityVault/"] ||
@@ -227,14 +259,24 @@ static BOOL AIVPathHasSymlink(NSURL *destination) {
             NSString *name = url.lastPathComponent.lowercaseString;
             if ([name hasSuffix:@"-journal"] || [name hasSuffix:@"-wal"] ||
                 [name hasSuffix:@"-shm"] || [name hasSuffix:@".aivtmp"]) continue;
+            BOOL preferencesFolder = [prefix hasSuffix:@"/Preferences"];
+            if (preferencesFolder ? ![name hasSuffix:@".plist"] : !AIVLikelyIdentityFile(relative))
+                continue;
             NSNumber *regular = nil, *link = nil, *size = nil;
             [url getResourceValue:&regular forKey:NSURLIsRegularFileKey error:NULL];
             [url getResourceValue:&link forKey:NSURLIsSymbolicLinkKey error:NULL];
             [url getResourceValue:&size forKey:NSURLFileSizeKey error:NULL];
             if (!regular.boolValue || link.boolValue) continue;
+            unsigned long long length = size.unsignedLongLongValue;
+            if (length > maxFile || totalSelected + length > maxTotal || descriptors.count >= 128) {
+                [warnings addObject:[NSString stringWithFormat:@"Identity file not included (size limit): %@", name]];
+                continue;
+            }
+            totalSelected += length;
             [descriptors addObject:@{@"url":url,
                                     @"path":[prefix stringByAppendingFormat:@"/%@", relative],
                                     @"size":size ?: @0}];
+            }
         }
         if (enumerationError) {
             if (error) *error = enumerationError;
@@ -248,12 +290,30 @@ static BOOL AIVPathHasSymlink(NSURL *destination) {
     NSMutableArray<NSString *> *warnings = [NSMutableArray array];
     NSArray *keychain = AIVKeychainSnapshot(warnings);
     NSUserDefaults *prefs = NSUserDefaults.standardUserDefaults;
+    NSString *bundleID = NSBundle.mainBundle.bundleIdentifier ?: @"";
+    NSDictionary *appDefaults = AIVSafePlistValue([prefs persistentDomainForName:bundleID] ?: @{}) ?: @{};
+    NSMutableDictionary *groupDefaults = [NSMutableDictionary dictionary];
+    for (NSString *group in AIVAppGroups()) {
+        NSUserDefaults *suite = [[NSUserDefaults alloc] initWithSuiteName:group];
+        if (!suite) continue;
+        groupDefaults[group] = AIVSafePlistValue([suite persistentDomainForName:group] ?: @{}) ?: @{};
+    }
+    NSString *fcUUID = [prefs stringForKey:@"fc_uuidForDevice"] ?: @"";
+    SEL fcSelector = NSSelectorFromString(@"fc_uuidForDevice");
+    if (!fcUUID.length && [UIDevice.currentDevice respondsToSelector:fcSelector]) {
+        id value = ((id (*)(id, SEL))objc_msgSend)(UIDevice.currentDevice, fcSelector);
+        if ([value isKindOfClass:NSString.class]) fcUUID = value;
+        else if ([value isKindOfClass:NSUUID.class]) fcUUID = [value UUIDString];
+    }
     return @{@"format":@2,
-             @"bundleID":NSBundle.mainBundle.bundleIdentifier ?: @"",
+             @"identityOnly":@YES,
+             @"bundleID":bundleID,
              @"appVersion":[NSBundle.mainBundle objectForInfoDictionaryKey:@"CFBundleShortVersionString"] ?: @"",
              @"created":[NSDate date],
              @"sourceIDFV":UIDevice.currentDevice.identifierForVendor.UUIDString ?: @"",
-             @"fcUUID":[prefs stringForKey:@"fc_uuidForDevice"] ?: @"",
+             @"fcUUID":fcUUID,
+             @"appDefaults":appDefaults,
+             @"groupDefaults":groupDefaults,
              @"groupIDs":AIVAppGroups(),
              @"keychain":keychain,
              @"warnings":warnings};
@@ -381,6 +441,31 @@ static BOOL AIVPathHasSymlink(NSURL *destination) {
         if (result == errSecSuccess) keychainRestored++;
         else [warnings addObject:[NSString stringWithFormat:@"Keychain record skipped (OSStatus %d).", (int)result]];
     }
+    // Restore the app's and entitled App Groups' persistent preferences.
+    // These commonly contain installation IDs, user IDs and session settings.
+    NSUInteger defaultsRestored = 0, suiteDefaultsRestored = 0;
+    NSDictionary *appDefaults = archive[@"appDefaults"];
+    NSDictionary *safeAppDefaults = AIVSafePlistValue(appDefaults);
+    if ([safeAppDefaults isKindOfClass:NSDictionary.class]) {
+        [NSUserDefaults.standardUserDefaults setPersistentDomain:safeAppDefaults forName:bundleID];
+        defaultsRestored = safeAppDefaults.count;
+    }
+    NSDictionary *groupDefaults = archive[@"groupDefaults"];
+    if ([groupDefaults isKindOfClass:NSDictionary.class]) {
+        NSArray *allowedGroups = AIVAppGroups();
+        for (id group in groupDefaults) {
+            if (![group isKindOfClass:NSString.class] || ![allowedGroups containsObject:group]) {
+                [warnings addObject:[NSString stringWithFormat:@"App Group preference access denied: %@", group]];
+                continue;
+            }
+            NSDictionary *safe = AIVSafePlistValue(groupDefaults[group]);
+            if (![safe isKindOfClass:NSDictionary.class]) continue;
+            NSUserDefaults *suite = [[NSUserDefaults alloc] initWithSuiteName:group];
+            [suite setPersistentDomain:safe forName:group];
+            [suite synchronize];
+            suiteDefaultsRestored += safe.count;
+        }
+    }
     // Restore the FCUUID preference automatically as part of the single restore action.
     // Apps that read an older value from Keychain or cache it in memory may still differ.
     BOOL fcUUIDRestored = NO;
@@ -410,8 +495,10 @@ static BOOL AIVPathHasSymlink(NSURL *destination) {
             [warnings addObject:@"Saved identifierForVendor was invalid; no override was applied."];
         }
     }
+    [NSUserDefaults.standardUserDefaults synchronize];
     return @{@"files":@(restored), @"keychain":@(keychainRestored),
              @"fcUUID":@(fcUUIDRestored), @"idfvOverride":@(idfvOverrideSaved),
+             @"defaults":@(defaultsRestored), @"groupDefaults":@(suiteDefaultsRestored),
              @"warnings":warnings};
 }
 

@@ -16,9 +16,16 @@ static NSString *AIVL(NSString *arabic, NSString *english) {
 // It cannot change the OS-provided vendor identity, code-signing Team ID, or App Attest.
 static IMP AIVOriginalIDFV = NULL;
 static NSUUID *AIVRestoredIDFV = nil;
+static IMP AIVOriginalFCUUID = NULL;
+static NSString *AIVRestoredFCUUID = nil;
 static NSUUID *AIVIdentifierForVendor(id target, SEL selector) {
     if (AIVRestoredIDFV) return AIVRestoredIDFV;
     return AIVOriginalIDFV ? ((NSUUID *(*)(id, SEL))AIVOriginalIDFV)(target, selector) : nil;
+}
+
+static id AIVFCUUIDForDevice(id target, SEL selector) {
+    if (AIVRestoredFCUUID.length) return AIVRestoredFCUUID;
+    return AIVOriginalFCUUID ? ((id (*)(id, SEL))AIVOriginalFCUUID)(target, selector) : nil;
 }
 
 static void AIVInstallIDFVOverride(void) {
@@ -27,6 +34,12 @@ static void AIVInstallIDFVOverride(void) {
     AIVRestoredIDFV = [[NSUUID alloc] initWithUUIDString:saved ?: @""];
     Method method = class_getInstanceMethod(UIDevice.class, @selector(identifierForVendor));
     if (method) AIVOriginalIDFV = method_setImplementation(method, (IMP)AIVIdentifierForVendor);
+    NSString *fcUUID = [NSUserDefaults.standardUserDefaults stringForKey:@"fc_uuidForDevice"];
+    if (fcUUID.length) {
+        AIVRestoredFCUUID = fcUUID;
+        Method fcMethod = class_getInstanceMethod(UIDevice.class, NSSelectorFromString(@"fc_uuidForDevice"));
+        if (fcMethod) AIVOriginalFCUUID = method_setImplementation(fcMethod, (IMP)AIVFCUUIDForDevice);
+    }
 }
 
 @interface AIVOverlay : NSObject <UIDocumentPickerDelegate>
@@ -105,9 +118,15 @@ static void AIVInstallIDFVOverride(void) {
 - (void)showMenu {
     UIViewController *controller = [self presenter];
     if (!controller) return;
+    NSString *description = AIVL(@"نسخ هوية التطبيق فقط: UUID وIDFV وتفضيلات الهوية وKeychain وملفات التوثيق الصغيرة؛ بدون الصور أو البيانات الكبيرة.",
+                                 @"Identity only: UUID, IDFV, identity preferences, Keychain and small authentication files. No photos or bulk app data.");
+    NSString *lastStage = [NSString stringWithContentsOfFile:[self backupStatusPath]
+                                             encoding:NSUTF8StringEncoding error:NULL];
+    if (lastStage.length && ![lastStage hasPrefix:@"Backup completed"])
+        description = [description stringByAppendingFormat:@"\n\n%@: %@",
+                           AIVL(@"آخر مرحلة للنسخ", @"Last backup stage"), lastStage];
     UIAlertController *sheet = [UIAlertController alertControllerWithTitle:@"App Identity Vault"
-            message:AIVL(@"اختر عملية واحدة. كل عملية تشمل الملفات وKeychain وApp Groups والمعرّفات الممكنة تلقائيًا.",
-                         @"Choose an action. Each action includes accessible files, Keychain, App Groups, and identifiers automatically.")
+            message:description
             preferredStyle:UIAlertControllerStyleAlert];
     [sheet addAction:[UIAlertAction actionWithTitle:AIVL(@"نسخ الهوية", @"Copy identity")
                                               style:UIAlertActionStyleDefault
@@ -122,6 +141,17 @@ static void AIVInstallIDFVOverride(void) {
                        dispatch_get_main_queue(), ^{ [self chooseBackup]; });
     }]];
     [controller presentViewController:sheet animated:YES completion:nil];
+}
+
+- (NSString *)backupStatusPath {
+    return [NSHomeDirectory() stringByAppendingPathComponent:
+            @"Documents/AppIdentityVault/last-backup-stage.txt"];
+}
+
+- (void)recordBackupStage:(NSString *)stage {
+    NSString *safe = stage.length > 240 ? [stage substringToIndex:240] : stage;
+    [safe writeToFile:[self backupStatusPath] atomically:YES
+            encoding:NSUTF8StringEncoding error:NULL];
 }
 
 - (void)beginBackup {
@@ -146,14 +176,29 @@ static void AIVInstallIDFVOverride(void) {
         NSString *timestamp = [NSString stringWithFormat:@"%.0f", NSDate.date.timeIntervalSince1970];
         NSString *path = [folder stringByAppendingPathComponent:
                           [NSString stringWithFormat:@"AppIdentityVault-%@.aiv", timestamp]];
-        BOOL success = !error && [AIVStream createBackupAtURL:[NSURL fileURLWithPath:path]
-                                                       error:&error];
+        BOOL success = NO;
         NSNumber *size = nil;
-        if (success) {
-            NSDictionary *attributes = [NSFileManager.defaultManager attributesOfItemAtPath:path error:&error];
-            size = attributes[NSFileSize];
-            success = size.unsignedLongLongValue > 36 && !error;
+        @try {
+            if (!error) {
+                [self recordBackupStage:@"Starting backup"]; 
+                success = [AIVStream createBackupAtURL:[NSURL fileURLWithPath:path]
+                    progress:^(NSString *stage) { [self recordBackupStage:stage]; }
+                       error:&error];
+            }
+            if (success) {
+                NSDictionary *attributes = [NSFileManager.defaultManager attributesOfItemAtPath:path error:&error];
+                size = attributes[NSFileSize];
+                success = size.unsignedLongLongValue > 36 && !error;
+            }
+        } @catch (NSException *exception) {
+            error = [NSError errorWithDomain:@"com.appidentityvault.backup" code:1001
+                userInfo:@{NSLocalizedDescriptionKey:[NSString stringWithFormat:
+                    @"File access exception: %@ (%@)", exception.name, exception.reason ?: @"unknown"]}];
+            success = NO;
+            [NSFileManager.defaultManager removeItemAtPath:[path stringByAppendingString:@".part"] error:NULL];
         }
+        if (!success) [self recordBackupStage:[NSString stringWithFormat:@"Backup failed: %@",
+                                 error.localizedDescription ?: @"Unknown file error"]];
         dispatch_async(dispatch_get_main_queue(), ^{
             void (^showResult)(void) = ^{
                 if (!success) {
@@ -239,10 +284,11 @@ static void AIVInstallIDFVOverride(void) {
 
 - (void)confirmRestorePreview:(NSDictionary *)archive URL:(NSURL *)url {
     NSString *detail = [NSString stringWithFormat:
-        AIVL(@"النسخة: %@\nملفات: %lu — سجلات Keychain: %lu\nتحذيرات النسخ: %lu\n\nالاستعادة ستستبدل ملفات التطبيق الحالية، وقد تؤثر على تسجيل الدخول. هل أنت متأكد؟",
-             @"Backup: %@\nFiles: %lu — Keychain records: %lu\nBackup warnings: %lu\n\nRestore overwrites current app files and may affect your login. Continue?"),
+        AIVL(@"النسخة: %@\nملفات هوية: %lu — Keychain: %lu — تفضيلات: %lu\nتحذيرات: %lu\n\nاللصق سيستبدل معرّفات وتفضيلات الهوية الحالية وقد يؤثر على تسجيل الدخول. هل أنت متأكد؟",
+             @"Backup: %@\nIdentity files: %lu — Keychain: %lu — Preferences: %lu\nWarnings: %lu\n\nRestoring replaces the current identity preferences and may affect your login. Continue?"),
         archive[@"created"] ?: @"?", (unsigned long)[archive[@"fileCount"] unsignedIntegerValue],
-        (unsigned long)[archive[@"keychain"] count], (unsigned long)[archive[@"warnings"] count]];
+        (unsigned long)[archive[@"keychain"] count], (unsigned long)[archive[@"appDefaults"] count],
+        (unsigned long)[archive[@"warnings"] count]];
     UIAlertController *alert = [UIAlertController alertControllerWithTitle:AIVL(@"تأكيد الاستعادة", @"Confirm restore")
                                                                 message:detail preferredStyle:UIAlertControllerStyleAlert];
     [alert addAction:[UIAlertAction actionWithTitle:AIVL(@"إلغاء", @"Cancel") style:UIAlertActionStyleCancel handler:nil]];
@@ -254,9 +300,9 @@ static void AIVInstallIDFVOverride(void) {
             dispatch_async(dispatch_get_main_queue(), ^{
                 NSUInteger issues = [report[@"warnings"] count];
                 NSString *message = error.localizedDescription ?: [NSString stringWithFormat:
-                    AIVL(@"تمت استعادة %@ ملف و%@ سجل Keychain. FCUUID: %@، IDFV: %@. تحذيرات: %lu. سيُغلق التطبيق الآن حتى تُحمَّل الهوية عند فتحه من جديد.",
-                         @"Restored %@ files and %@ Keychain records. FCUUID: %@, IDFV: %@. Warnings: %lu. The app will close so the restored values are loaded next launch."),
-                    report[@"files"] ?: @0, report[@"keychainRestored"] ?: @0,
+                    AIVL(@"استعدت %@ ملف هوية، %@ عنصر Keychain، و%@ تفضيل. FCUUID: %@، IDFV: %@. تحذيرات: %lu. سيُغلق التطبيق لتفعيل الهوية عند إعادة فتحه.",
+                         @"Restored %@ identity files, %@ Keychain items and %@ preferences. FCUUID: %@, IDFV: %@. Warnings: %lu. The app will close to reload the identity."),
+                    report[@"files"] ?: @0, report[@"keychainRestored"] ?: @0, report[@"defaults"] ?: @0,
                     [report[@"fcUUIDRestored"] boolValue] ? AIVL(@"نعم", @"yes") : AIVL(@"غير متاح", @"unavailable"),
                     [report[@"idfvOverride"] boolValue] ? AIVL(@"داخل التطبيق", @"in-app override") : AIVL(@"غير متاح", @"unavailable"),
                     (unsigned long)issues];
