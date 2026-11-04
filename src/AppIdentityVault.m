@@ -93,6 +93,12 @@ static void AIVInstallIDFVOverride(void) {
         button.layer.shadowOpacity = 0.25;
         button.accessibilityLabel = @"App Identity Vault";
         [button addTarget:self action:@selector(showMenu) forControlEvents:UIControlEventTouchUpInside];
+        [button addTarget:self action:@selector(buttonTouchDown:) forControlEvents:UIControlEventTouchDown];
+        [button addTarget:self action:@selector(buttonTouchUp:) forControlEvents:
+            UIControlEventTouchUpInside | UIControlEventTouchUpOutside | UIControlEventTouchCancel];
+        UIPanGestureRecognizer *pan = [[UIPanGestureRecognizer alloc]
+                                        initWithTarget:self action:@selector(dragButton:)];
+        [button addGestureRecognizer:pan];
         self.floatingButton = button;
     }
     if (self.floatingButton.superview != window) {
@@ -102,6 +108,38 @@ static void AIVInstallIDFVOverride(void) {
         [window addSubview:self.floatingButton];
     }
     [window bringSubviewToFront:self.floatingButton];
+}
+
+- (void)buttonTouchDown:(UIButton *)button {
+    [UIView animateWithDuration:0.16 animations:^{ button.transform = CGAffineTransformMakeScale(0.93, 0.93); }];
+}
+
+- (void)buttonTouchUp:(UIButton *)button {
+    [UIView animateWithDuration:0.2 delay:0 usingSpringWithDamping:0.65
+          initialSpringVelocity:0.2 options:UIViewAnimationOptionBeginFromCurrentState
+          animations:^{ button.transform = CGAffineTransformIdentity; } completion:nil];
+}
+
+- (void)dragButton:(UIPanGestureRecognizer *)gesture {
+    UIView *button = gesture.view;
+    UIWindow *window = [self activeWindow];
+    if (!window || !button) return;
+    CGPoint move = [gesture translationInView:window];
+    CGPoint position = button.center;
+    CGFloat margin = button.bounds.size.width * 0.5 + 8;
+    position.x = MIN(MAX(position.x + move.x, margin), window.bounds.size.width - margin);
+    position.y = MIN(MAX(position.y + move.y, window.safeAreaInsets.top + margin),
+                     window.bounds.size.height - window.safeAreaInsets.bottom - margin);
+    button.center = position;
+    [gesture setTranslation:CGPointZero inView:window];
+    if (gesture.state == UIGestureRecognizerStateEnded || gesture.state == UIGestureRecognizerStateCancelled) {
+        BOOL right = position.x >= window.bounds.size.width / 2.0;
+        position.x = right ? window.bounds.size.width - margin : margin;
+        [UIView animateWithDuration:0.28 delay:0 usingSpringWithDamping:0.75
+              initialSpringVelocity:0.1 options:UIViewAnimationOptionBeginFromCurrentState
+              animations:^{ button.center = position; button.transform = CGAffineTransformIdentity; }
+              completion:nil];
+    }
 }
 
 - (void)message:(NSString *)title detail:(NSString *)detail {
@@ -118,15 +156,9 @@ static void AIVInstallIDFVOverride(void) {
 - (void)showMenu {
     UIViewController *controller = [self presenter];
     if (!controller) return;
-    NSString *description = AIVL(@"نسخ هوية التطبيق فقط: UUID وIDFV وتفضيلات الهوية وKeychain وملفات التوثيق الصغيرة؛ بدون الصور أو البيانات الكبيرة.",
-                                 @"Identity only: UUID, IDFV, identity preferences, Keychain and small authentication files. No photos or bulk app data.");
-    NSString *lastStage = [NSString stringWithContentsOfFile:[self backupStatusPath]
-                                             encoding:NSUTF8StringEncoding error:NULL];
-    if (lastStage.length && ![lastStage hasPrefix:@"Backup completed"])
-        description = [description stringByAppendingFormat:@"\n\n%@: %@",
-                           AIVL(@"آخر مرحلة للنسخ", @"Last backup stage"), lastStage];
+    [[[UIImpactFeedbackGenerator alloc] initWithStyle:UIImpactFeedbackStyleLight] impactOccurred];
     UIAlertController *sheet = [UIAlertController alertControllerWithTitle:@"App Identity Vault"
-            message:description
+            message:nil
             preferredStyle:UIAlertControllerStyleAlert];
     [sheet addAction:[UIAlertAction actionWithTitle:AIVL(@"نسخ الهوية", @"Copy identity")
                                               style:UIAlertActionStyleDefault
@@ -158,9 +190,8 @@ static void AIVInstallIDFVOverride(void) {
     UIViewController *controller = [self presenter];
     if (!controller) return;
     UIAlertController *progress = [UIAlertController alertControllerWithTitle:
-        AIVL(@"جاري نسخ الهوية…", @"Backing up identity…")
-        message:AIVL(@"انتظر شوي. لا تقفل التطبيق لين يكتمل الحفظ.",
-                     @"Please keep the app open while its data is copied.")
+        AIVL(@"جاري النسخ…", @"Copying…")
+        message:nil
         preferredStyle:UIAlertControllerStyleAlert];
     [controller presentViewController:progress animated:YES completion:nil];
     // Never make the actual backup depend on a modal presentation completion.
@@ -206,7 +237,7 @@ static void AIVInstallIDFVOverride(void) {
                              detail:error.localizedDescription ?: AIVL(@"تعذر إنشاء الملف. تحقق من المساحة المتوفرة.",
                                                                        @"Could not create the file. Check free storage.")];
                 } else {
-                    [self showBackupReady:[NSURL fileURLWithPath:path] size:size];
+                    [self showBackupReady:[NSURL fileURLWithPath:path]];
                 }
             };
             if (progress.presentingViewController) {
@@ -219,21 +250,17 @@ static void AIVInstallIDFVOverride(void) {
     });
 }
 
-- (void)showBackupReady:(NSURL *)file size:(NSNumber *)size {
-    NSString *detail = [NSString stringWithFormat:
-        AIVL(@"انحفظت النسخة داخل التطبيق (%@ MB). اضغط حفظ في الملفات عشان تنقلها لمكان آمن قبل الفورمات.\n\nتنبيه: النسخة بدون تشفير وتحتوي بيانات خاصة.",
-             @"The backup was created inside the app (%@ MB). Tap Save to Files to export it before resetting your phone.\n\nWarning: the backup is NOT encrypted and contains private data."),
-        [NSString stringWithFormat:@"%.1f", size.doubleValue / 1048576.0]];
+- (void)showBackupReady:(NSURL *)file {
+    [[[UINotificationFeedbackGenerator alloc] init] notificationOccurred:UINotificationFeedbackTypeSuccess];
     UIAlertController *done = [UIAlertController alertControllerWithTitle:
-        AIVL(@"تم نسخ الهوية ✅", @"Identity backup ready ✅")
-        message:detail preferredStyle:UIAlertControllerStyleAlert];
-    [done addAction:[UIAlertAction actionWithTitle:AIVL(@"حفظ في الملفات", @"Save to Files")
+        AIVL(@"تم النسخ ✅", @"Copied ✅")
+        message:AIVL(@"وين تبي تحفظ النسخة؟", @"Where would you like to save it?")
+        preferredStyle:UIAlertControllerStyleAlert];
+    [done addAction:[UIAlertAction actionWithTitle:AIVL(@"اختيار مكان الحفظ", @"Choose location")
         style:UIAlertActionStyleDefault handler:^(__unused UIAlertAction *action) {
             dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.3 * NSEC_PER_SEC)),
                            dispatch_get_main_queue(), ^{ [self exportBackup:file]; });
         }]];
-    [done addAction:[UIAlertAction actionWithTitle:AIVL(@"ليس الآن", @"Not now")
-        style:UIAlertActionStyleCancel handler:nil]];
     [[self presenter] presentViewController:done animated:YES completion:nil];
 }
 
@@ -260,73 +287,65 @@ static void AIVInstallIDFVOverride(void) {
 - (void)documentPicker:(UIDocumentPickerViewController *)controller didPickDocumentsAtURLs:(NSArray<NSURL *> *)urls {
     NSURL *url = urls.firstObject;
     if (!url || ![url.pathExtension.lowercaseString isEqualToString:@"aiv"]) {
-        [self message:AIVL(@"نوع ملف غير مدعوم", @"Unsupported file")
-                 detail:@"Choose an AppIdentityVault .aiv file."];
+        [self message:AIVL(@"ملف غير صالح", @"Invalid file")
+                 detail:AIVL(@"اختر ملف هوية .aiv", @"Choose an .aiv identity file.")];
         return;
     }
-    // Let the document picker dismiss before another modal is presented.
+    // Wait until the Files picker dismisses, then restore directly.
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.4 * NSEC_PER_SEC)),
-                   dispatch_get_main_queue(), ^{ [self verifyRestoreURL:url]; });
+                   dispatch_get_main_queue(), ^{ [self restoreChosenFile:url]; });
 }
 
-- (void)verifyRestoreURL:(NSURL *)url {
-    dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
-        NSError *error = nil;
-        NSDictionary *archive = [AIVStream previewAtURL:url error:&error];
-        dispatch_async(dispatch_get_main_queue(), ^{
-            if (!archive) {
-                [self message:AIVL(@"تعذرت الاستعادة", @"Cannot restore")
-                         detail:error.localizedDescription ?: @"Invalid archive"];
-            } else [self confirmRestorePreview:archive URL:url];
+- (void)restoreChosenFile:(NSURL *)url {
+    UIViewController *controller = [self presenter];
+    if (!controller) return;
+    UIAlertController *progress = [UIAlertController alertControllerWithTitle:
+        AIVL(@"جاري اللصق…", @"Pasting…") message:nil
+        preferredStyle:UIAlertControllerStyleAlert];
+    [controller presentViewController:progress animated:YES completion:nil];
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.2 * NSEC_PER_SEC)),
+                   dispatch_get_main_queue(), ^{
+        dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
+            NSError *error = nil;
+            NSDictionary *report = nil;
+            @try {
+                NSDictionary *preview = [AIVStream previewAtURL:url error:&error];
+                if (preview && !error) report = [AIVStream restoreAtURL:url error:&error];
+            } @catch (NSException *exception) {
+                error = [NSError errorWithDomain:@"com.appidentityvault.restore" code:1002
+                    userInfo:@{NSLocalizedDescriptionKey:exception.reason ?: @"Restore interrupted"}];
+            }
+            dispatch_async(dispatch_get_main_queue(), ^{
+                void (^finish)(void) = ^{
+                    if (!report || error) {
+                        [[[UINotificationFeedbackGenerator alloc] init]
+                            notificationOccurred:UINotificationFeedbackTypeError];
+                        [self message:AIVL(@"تعذر اللصق", @"Paste failed")
+                                 detail:AIVL(@"تأكد من ملف الهوية وجرّب مرة ثانية.",
+                                             @"Check the identity file and try again.")];
+                    } else {
+                        [self showPasteCompleted];
+                    }
+                };
+                if (progress.presentingViewController)
+                    [progress dismissViewControllerAnimated:YES completion:finish];
+                else finish();
+            });
         });
     });
 }
 
-- (void)confirmRestorePreview:(NSDictionary *)archive URL:(NSURL *)url {
-    NSString *detail = [NSString stringWithFormat:
-        AIVL(@"النسخة: %@\nملفات هوية: %lu — Keychain: %lu — تفضيلات: %lu\nتحذيرات: %lu\n\nاللصق سيستبدل معرّفات وتفضيلات الهوية الحالية وقد يؤثر على تسجيل الدخول. هل أنت متأكد؟",
-             @"Backup: %@\nIdentity files: %lu — Keychain: %lu — Preferences: %lu\nWarnings: %lu\n\nRestoring replaces the current identity preferences and may affect your login. Continue?"),
-        archive[@"created"] ?: @"?", (unsigned long)[archive[@"fileCount"] unsignedIntegerValue],
-        (unsigned long)[archive[@"keychain"] count], (unsigned long)[archive[@"appDefaults"] count],
-        (unsigned long)[archive[@"warnings"] count]];
-    UIAlertController *alert = [UIAlertController alertControllerWithTitle:AIVL(@"تأكيد الاستعادة", @"Confirm restore")
-                                                                message:detail preferredStyle:UIAlertControllerStyleAlert];
-    [alert addAction:[UIAlertAction actionWithTitle:AIVL(@"إلغاء", @"Cancel") style:UIAlertActionStyleCancel handler:nil]];
-    [alert addAction:[UIAlertAction actionWithTitle:AIVL(@"استعادة", @"Restore")
-                                             style:UIAlertActionStyleDestructive handler:^(__unused UIAlertAction *action) {
-        dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
-            NSError *error = nil;
-            NSDictionary *report = [AIVStream restoreAtURL:url error:&error];
-            dispatch_async(dispatch_get_main_queue(), ^{
-                NSUInteger issues = [report[@"warnings"] count];
-                NSString *message = error.localizedDescription ?: [NSString stringWithFormat:
-                    AIVL(@"استعدت %@ ملف هوية، %@ عنصر Keychain، و%@ تفضيل. FCUUID: %@، IDFV: %@. تحذيرات: %lu. سيُغلق التطبيق لتفعيل الهوية عند إعادة فتحه.",
-                         @"Restored %@ identity files, %@ Keychain items and %@ preferences. FCUUID: %@, IDFV: %@. Warnings: %lu. The app will close to reload the identity."),
-                    report[@"files"] ?: @0, report[@"keychainRestored"] ?: @0, report[@"defaults"] ?: @0,
-                    [report[@"fcUUIDRestored"] boolValue] ? AIVL(@"نعم", @"yes") : AIVL(@"غير متاح", @"unavailable"),
-                    [report[@"idfvOverride"] boolValue] ? AIVL(@"داخل التطبيق", @"in-app override") : AIVL(@"غير متاح", @"unavailable"),
-                    (unsigned long)issues];
-                if (issues) message = [message stringByAppendingFormat:@"\n%@",
-                                     [[report[@"warnings"] subarrayWithRange:NSMakeRange(0, MIN(issues, 3))] componentsJoinedByString:@"\n"]];
-                if (error || !report) {
-                    [self message:AIVL(@"تعذرت الاستعادة", @"Restore failed") detail:message];
-                } else {
-                    UIAlertController *done = [UIAlertController alertControllerWithTitle:
-                        AIVL(@"اكتملت عملية اللصق", @"Paste completed") message:message
-                        preferredStyle:UIAlertControllerStyleAlert];
-                    [done addAction:[UIAlertAction actionWithTitle:
-                        AIVL(@"إغلاق التطبيق لتطبيق الهوية", @"Close app to apply identity")
-                        style:UIAlertActionStyleDefault handler:^(__unused UIAlertAction *action) {
-                            // iOS provides no supported API to relaunch a re-signed app automatically.
-                            // Closing ensures cached UUID/session values are reloaded on next manual launch.
-                            exit(0);
-                        }]];
-                    [[self presenter] presentViewController:done animated:YES completion:nil];
-                }
-            });
-        });
-    }]];
-    [[self presenter] presentViewController:alert animated:YES completion:nil];
+- (void)showPasteCompleted {
+    [[[UINotificationFeedbackGenerator alloc] init]
+        notificationOccurred:UINotificationFeedbackTypeSuccess];
+    UIAlertController *done = [UIAlertController alertControllerWithTitle:
+        AIVL(@"تم اللصق ✅", @"Pasted ✅")
+        message:AIVL(@"افتح التطبيق مرة ثانية.", @"Open the app again.")
+        preferredStyle:UIAlertControllerStyleAlert];
+    [[self presenter] presentViewController:done animated:YES completion:nil];
+    // Apply restored values on next launch; no extra confirmation/button.
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(2.0 * NSEC_PER_SEC)),
+                   dispatch_get_main_queue(), ^{ exit(0); });
 }
 
 @end
