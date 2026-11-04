@@ -2,12 +2,12 @@
 
 NS_ASSUME_NONNULL_BEGIN
 
-/// AIV2: encrypted, authenticated, streaming file records.
-/// Files are processed in bounded chunks regardless of their total size.
+/// AIV3: password-free streaming records with SHA-256 corruption detection.
+/// The archive is NOT encrypted: keep exported files in a private location.
 @interface AIVStream : NSObject
-+ (BOOL)createBackupAtURL:(NSURL *)url password:(NSString *)password error:(NSError **)error;
-+ (nullable NSDictionary *)previewAtURL:(NSURL *)url password:(NSString *)password error:(NSError **)error;
-+ (nullable NSDictionary *)restoreAtURL:(NSURL *)url password:(NSString *)password error:(NSError **)error;
++ (BOOL)createBackupAtURL:(NSURL *)url error:(NSError **)error;
++ (nullable NSDictionary *)previewAtURL:(NSURL *)url error:(NSError **)error;
++ (nullable NSDictionary *)restoreAtURL:(NSURL *)url error:(NSError **)error;
 @end
 
 NS_ASSUME_NONNULL_END

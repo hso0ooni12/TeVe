@@ -111,43 +111,29 @@ static void AIVInstallIDFVOverride(void) {
             preferredStyle:UIAlertControllerStyleAlert];
     [sheet addAction:[UIAlertAction actionWithTitle:AIVL(@"نسخ الهوية", @"Copy identity")
                                               style:UIAlertActionStyleDefault
-                                            handler:^(__unused UIAlertAction *action) { [self askBackupPassword]; }]];
+                                            handler:^(__unused UIAlertAction *action) {
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.3 * NSEC_PER_SEC)),
+                       dispatch_get_main_queue(), ^{ [self beginBackup]; });
+    }]];
     [sheet addAction:[UIAlertAction actionWithTitle:AIVL(@"لصق الهوية", @"Paste identity")
                                               style:UIAlertActionStyleDefault
-                                            handler:^(__unused UIAlertAction *action) { [self chooseBackup]; }]];
+                                            handler:^(__unused UIAlertAction *action) {
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.3 * NSEC_PER_SEC)),
+                       dispatch_get_main_queue(), ^{ [self chooseBackup]; });
+    }]];
     [controller presentViewController:sheet animated:YES completion:nil];
 }
 
-- (void)askBackupPassword {
-    UIAlertController *alert = [UIAlertController alertControllerWithTitle:AIVL(@"تشفير النسخة", @"Encrypt backup")
-        message:AIVL(@"ستتضمن النسخة بيانات محلية حساسة؛ احفظ كلمة المرور، فلن نستطيع استرجاعها.",
-                     @"The backup may include sensitive local data. Store the password securely; it cannot be recovered.")
+- (void)beginBackup {
+    UIViewController *controller = [self presenter];
+    if (!controller) return;
+    UIAlertController *progress = [UIAlertController alertControllerWithTitle:
+        AIVL(@"جاري نسخ الهوية…", @"Backing up identity…")
+        message:AIVL(@"انتظر شوي. لا تقفل التطبيق لين يكتمل الحفظ.",
+                     @"Please keep the app open while its data is copied.")
         preferredStyle:UIAlertControllerStyleAlert];
-    for (NSString *hint in @[AIVL(@"كلمة المرور (8 رموز أو أكثر)", @"Password (8+ characters)"),
-                             AIVL(@"تأكيد كلمة المرور", @"Confirm password")]) {
-        [alert addTextFieldWithConfigurationHandler:^(UITextField *field) {
-            field.secureTextEntry = YES; field.placeholder = hint;
-            field.textContentType = UITextContentTypeNewPassword;
-        }];
-    }
-    [alert addAction:[UIAlertAction actionWithTitle:AIVL(@"إلغاء", @"Cancel") style:UIAlertActionStyleCancel handler:nil]];
-    [alert addAction:[UIAlertAction actionWithTitle:AIVL(@"إنشاء النسخة", @"Create backup")
-                                             style:UIAlertActionStyleDefault handler:^(__unused UIAlertAction *action) {
-        NSString *pass = alert.textFields[0].text ?: @"";
-        NSString *again = alert.textFields[1].text ?: @"";
-        if (pass.length < 8 || ![pass isEqualToString:again]) {
-            [self message:AIVL(@"كلمة المرور غير صحيحة", @"Password error")
-                     detail:AIVL(@"لازم 8 رموز على الأقل وكلمتا المرور متطابقتان.",
-                                  @"Use 8+ characters and enter the same password twice.")];
-            return;
-        }
-        [self createBackupWithPassword:pass];
-    }]];
-    [[self presenter] presentViewController:alert animated:YES completion:nil];
-}
-
-- (void)createBackupWithPassword:(NSString *)password {
-    dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
+    [controller presentViewController:progress animated:YES completion:^{
+      dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
         NSError *error = nil;
         NSString *folder = [NSHomeDirectory() stringByAppendingPathComponent:@"Documents/AppIdentityVault"];
         [[NSFileManager defaultManager] createDirectoryAtPath:folder
@@ -156,21 +142,56 @@ static void AIVInstallIDFVOverride(void) {
         NSString *path = [folder stringByAppendingPathComponent:
                           [NSString stringWithFormat:@"AppIdentityVault-%@.aiv", timestamp]];
         BOOL success = !error && [AIVStream createBackupAtURL:[NSURL fileURLWithPath:path]
-                                                      password:password error:&error];
+                                                       error:&error];
+        NSNumber *size = nil;
+        if (success) {
+            NSDictionary *attributes = [NSFileManager.defaultManager attributesOfItemAtPath:path error:&error];
+            size = attributes[NSFileSize];
+            success = size.unsignedLongLongValue > 36 && !error;
+        }
         dispatch_async(dispatch_get_main_queue(), ^{
-            if (error || !success) {
-                [self message:AIVL(@"فشل النسخ", @"Backup failed")
-                         detail:error.localizedDescription ?: @"Unknown error"];
-                return;
-            }
-            NSURL *file = [NSURL fileURLWithPath:path];
-            UIDocumentPickerViewController *exporter = [[UIDocumentPickerViewController alloc]
-                                                        initForExportingURLs:@[file] asCopy:YES];
-            UIViewController *controller = [self presenter];
-            if (controller) [controller presentViewController:exporter animated:YES completion:nil];
-            // The encrypted .aiv file stays in Documents until the user deletes it.
+            [progress dismissViewControllerAnimated:YES completion:^{
+                if (!success) {
+                    [self message:AIVL(@"فشل النسخ", @"Backup failed")
+                             detail:error.localizedDescription ?: AIVL(@"تعذر إنشاء الملف. تحقق من المساحة المتوفرة.",
+                                                                       @"Could not create the file. Check free storage.")];
+                } else {
+                    [self showBackupReady:[NSURL fileURLWithPath:path] size:size];
+                }
+            }];
         });
-    });
+      });
+    }];
+}
+
+- (void)showBackupReady:(NSURL *)file size:(NSNumber *)size {
+    NSString *detail = [NSString stringWithFormat:
+        AIVL(@"انحفظت النسخة داخل التطبيق (%@ MB). اضغط حفظ في الملفات عشان تنقلها لمكان آمن قبل الفورمات.\n\nتنبيه: النسخة بدون تشفير وتحتوي بيانات خاصة.",
+             @"The backup was created inside the app (%@ MB). Tap Save to Files to export it before resetting your phone.\n\nWarning: the backup is NOT encrypted and contains private data."),
+        [NSString stringWithFormat:@"%.1f", size.doubleValue / 1048576.0]];
+    UIAlertController *done = [UIAlertController alertControllerWithTitle:
+        AIVL(@"تم نسخ الهوية ✅", @"Identity backup ready ✅")
+        message:detail preferredStyle:UIAlertControllerStyleAlert];
+    [done addAction:[UIAlertAction actionWithTitle:AIVL(@"حفظ في الملفات", @"Save to Files")
+        style:UIAlertActionStyleDefault handler:^(__unused UIAlertAction *action) {
+            dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.3 * NSEC_PER_SEC)),
+                           dispatch_get_main_queue(), ^{ [self exportBackup:file]; });
+        }]];
+    [done addAction:[UIAlertAction actionWithTitle:AIVL(@"ليس الآن", @"Not now")
+        style:UIAlertActionStyleCancel handler:nil]];
+    [[self presenter] presentViewController:done animated:YES completion:nil];
+}
+
+- (void)exportBackup:(NSURL *)file {
+    if (![NSFileManager.defaultManager fileExistsAtPath:file.path]) {
+        [self message:AIVL(@"الملف غير موجود", @"File not found")
+                 detail:AIVL(@"أعد عملية النسخ.", @"Please create the backup again.")];
+        return;
+    }
+    UIDocumentPickerViewController *exporter = [[UIDocumentPickerViewController alloc]
+                                                initForExportingURLs:@[file] asCopy:YES];
+    UIViewController *controller = [self presenter];
+    if (controller) [controller presentViewController:exporter animated:YES completion:nil];
 }
 
 - (void)chooseBackup {
@@ -188,37 +209,25 @@ static void AIVInstallIDFVOverride(void) {
                  detail:@"Choose an AppIdentityVault .aiv file."];
         return;
     }
-    [self askRestorePasswordForURL:url];
+    // Let the document picker dismiss before another modal is presented.
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.4 * NSEC_PER_SEC)),
+                   dispatch_get_main_queue(), ^{ [self verifyRestoreURL:url]; });
 }
 
-- (void)askRestorePasswordForURL:(NSURL *)url {
-    UIAlertController *alert = [UIAlertController alertControllerWithTitle:AIVL(@"استعادة نسخة", @"Restore backup")
-        message:AIVL(@"أدخل كلمة المرور لفك تشفير النسخة والتحقق منها.",
-                     @"Enter the password to authenticate and decrypt this backup.")
-        preferredStyle:UIAlertControllerStyleAlert];
-    [alert addTextFieldWithConfigurationHandler:^(UITextField *field) {
-        field.placeholder = AIVL(@"كلمة المرور", @"Password");
-        field.secureTextEntry = YES;
-    }];
-    [alert addAction:[UIAlertAction actionWithTitle:AIVL(@"إلغاء", @"Cancel") style:UIAlertActionStyleCancel handler:nil]];
-    [alert addAction:[UIAlertAction actionWithTitle:AIVL(@"تحقق", @"Verify")
-                                             style:UIAlertActionStyleDefault handler:^(__unused UIAlertAction *action) {
-        NSString *pass = alert.textFields.firstObject.text ?: @"";
-        dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
-            NSError *error = nil;
-            NSDictionary *archive = [AIVStream previewAtURL:url password:pass error:&error];
-            dispatch_async(dispatch_get_main_queue(), ^{
-                if (!archive) {
-                    [self message:AIVL(@"تعذرت الاستعادة", @"Cannot restore")
-                             detail:error.localizedDescription ?: @"Invalid archive"];
-                } else [self confirmRestorePreview:archive URL:url password:pass];
-            });
+- (void)verifyRestoreURL:(NSURL *)url {
+    dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
+        NSError *error = nil;
+        NSDictionary *archive = [AIVStream previewAtURL:url error:&error];
+        dispatch_async(dispatch_get_main_queue(), ^{
+            if (!archive) {
+                [self message:AIVL(@"تعذرت الاستعادة", @"Cannot restore")
+                         detail:error.localizedDescription ?: @"Invalid archive"];
+            } else [self confirmRestorePreview:archive URL:url];
         });
-    }]];
-    [[self presenter] presentViewController:alert animated:YES completion:nil];
+    });
 }
 
-- (void)confirmRestorePreview:(NSDictionary *)archive URL:(NSURL *)url password:(NSString *)password {
+- (void)confirmRestorePreview:(NSDictionary *)archive URL:(NSURL *)url {
     NSString *detail = [NSString stringWithFormat:
         AIVL(@"النسخة: %@\nملفات: %lu — سجلات Keychain: %lu\nتحذيرات النسخ: %lu\n\nالاستعادة ستستبدل ملفات التطبيق الحالية، وقد تؤثر على تسجيل الدخول. هل أنت متأكد؟",
              @"Backup: %@\nFiles: %lu — Keychain records: %lu\nBackup warnings: %lu\n\nRestore overwrites current app files and may affect your login. Continue?"),
@@ -231,7 +240,7 @@ static void AIVInstallIDFVOverride(void) {
                                              style:UIAlertActionStyleDestructive handler:^(__unused UIAlertAction *action) {
         dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
             NSError *error = nil;
-            NSDictionary *report = [AIVStream restoreAtURL:url password:password error:&error];
+            NSDictionary *report = [AIVStream restoreAtURL:url error:&error];
             dispatch_async(dispatch_get_main_queue(), ^{
                 NSUInteger issues = [report[@"warnings"] count];
                 NSString *message = error.localizedDescription ?: [NSString stringWithFormat:

@@ -11,6 +11,8 @@ static NSString *const AIVStreamDomain = @"com.appidentityvault.stream";
 static const NSUInteger AIVChunk = 64 * 1024;
 static const NSUInteger AIVHeaderSize = 4 + 16 + 16 + CC_SHA256_DIGEST_LENGTH;
 static const uint8_t AIVMagic2[4] = {'A','I','V','2'};
+static const uint8_t AIVMagic3[4] = {'A','I','V','3'};
+static const NSUInteger AIVPlainHeaderSize = 4 + CC_SHA256_DIGEST_LENGTH;
 
 static NSError *AIVSErr(NSInteger code, NSString *message) {
     return [NSError errorWithDomain:AIVStreamDomain code:code
@@ -87,7 +89,17 @@ static NSURL *AIVSQLiteSnapshot(NSURL *sourceURL, NSURL *directory, NSError **er
     return targetURL;
 }
 
-@interface AIVEncryptedWriter : NSObject {
+@protocol AIVRecordWriter <NSObject>
+- (BOOL)append:(NSData *)plain error:(NSError **)error;
+- (BOOL)finish:(NSError **)error;
+@end
+
+@protocol AIVRecordReader <NSObject>
+- (nullable NSData *)readExactly:(NSUInteger)length error:(NSError **)error;
+- (BOOL)atEnd:(NSError **)error;
+@end
+
+@interface AIVEncryptedWriter : NSObject <AIVRecordWriter> {
     CCCryptorRef _cryptor;
     CCHmacContext _hmac;
     uint8_t _keys[64];
@@ -178,7 +190,7 @@ static NSURL *AIVSQLiteSnapshot(NSURL *sourceURL, NSURL *directory, NSError **er
 }
 @end
 
-@interface AIVEncryptedReader : NSObject {
+@interface AIVEncryptedReader : NSObject <AIVRecordReader> {
     CCCryptorRef _cryptor;
     uint8_t _keys[64];
     uint64_t _cipherRemaining;
@@ -303,7 +315,129 @@ static NSURL *AIVSQLiteSnapshot(NSURL *sourceURL, NSURL *directory, NSError **er
 }
 @end
 
-static BOOL AIVWriteRecord(AIVEncryptedWriter *writer, uint8_t type,
+// AIV3 intentionally has no password prompt. It is a plain archive whose hash
+// detects accidental corruption; the hash is not an authentication signature.
+@interface AIVPlainWriter : NSObject <AIVRecordWriter> {
+    CC_SHA256_CTX _hash;
+}
+@property (nonatomic, strong) NSFileHandle *file;
+- (nullable instancetype)initWithURL:(NSURL *)url error:(NSError **)error;
+@end
+
+@implementation AIVPlainWriter
+- (instancetype)initWithURL:(NSURL *)url error:(NSError **)error {
+    self = [super init];
+    if (!self) return nil;
+    if (![NSFileManager.defaultManager createFileAtPath:url.path contents:nil attributes:nil]) {
+        if (error) *error = AIVSErr(31, @"Could not create a backup file. Check free storage.");
+        return nil;
+    }
+    self.file = [NSFileHandle fileHandleForWritingToURL:url error:error];
+    if (!self.file) return nil;
+    uint8_t header[AIVPlainHeaderSize] = {0};
+    memcpy(header, AIVMagic3, 4);
+    CC_SHA256_Init(&_hash);
+    if (![self.file writeData:[NSData dataWithBytes:header length:sizeof(header)] error:error]) return nil;
+    return self;
+}
+
+- (void)dealloc { [self.file closeFile]; }
+
+- (BOOL)append:(NSData *)plain error:(NSError **)error {
+    if (!plain.length) return YES;
+    if (![self.file writeData:plain error:error]) return NO;
+    CC_SHA256_Update(&_hash, plain.bytes, (CC_LONG)plain.length);
+    return YES;
+}
+
+- (BOOL)finish:(NSError **)error {
+    uint8_t digest[CC_SHA256_DIGEST_LENGTH];
+    CC_SHA256_Final(digest, &_hash);
+    if (![self.file seekToOffset:4 error:error]) return NO;
+    if (![self.file writeData:[NSData dataWithBytes:digest length:sizeof(digest)] error:error]) return NO;
+    [self.file synchronizeFile];
+    [self.file closeFile];
+    self.file = nil;
+    return YES;
+}
+@end
+
+@interface AIVPlainReader : NSObject <AIVRecordReader> {
+    uint64_t _remaining;
+}
+@property (nonatomic, strong) NSFileHandle *file;
+- (nullable instancetype)initWithURL:(NSURL *)url error:(NSError **)error;
+@end
+
+@implementation AIVPlainReader
+- (instancetype)initWithURL:(NSURL *)url error:(NSError **)error {
+    self = [super init];
+    if (!self) return nil;
+    self.file = [NSFileHandle fileHandleForReadingFromURL:url error:error];
+    if (!self.file) return nil;
+    NSNumber *length = nil;
+    if (![url getResourceValue:&length forKey:NSURLFileSizeKey error:error]) return nil;
+    if (length.unsignedLongLongValue < AIVPlainHeaderSize + 13) {
+        if (error) *error = AIVSErr(32, @"The backup file is incomplete.");
+        return nil;
+    }
+    NSData *header = [self.file readDataOfLength:AIVPlainHeaderSize];
+    if (header.length != AIVPlainHeaderSize || memcmp(header.bytes, AIVMagic3, 4) != 0) {
+        if (error) *error = AIVSErr(33, @"This is not a password-free AIV3 backup. Create a new backup with the latest tool.");
+        return nil;
+    }
+    const uint8_t *bytes = header.bytes;
+    CC_SHA256_CTX context;
+    CC_SHA256_Init(&context);
+    uint64_t left = length.unsignedLongLongValue - AIVPlainHeaderSize;
+    while (left) {
+        NSData *part = [self.file readDataOfLength:(NSUInteger)MIN((uint64_t)AIVChunk, left)];
+        if (!part.length) {
+            if (error) *error = AIVSErr(34, @"The backup file ended unexpectedly.");
+            return nil;
+        }
+        CC_SHA256_Update(&context, part.bytes, (CC_LONG)part.length);
+        left -= part.length;
+    }
+    uint8_t digest[CC_SHA256_DIGEST_LENGTH];
+    CC_SHA256_Final(digest, &context);
+    if (!AIVSameMAC(digest, bytes + 4)) {
+        if (error) *error = AIVSErr(35, @"The backup file is damaged or incomplete.");
+        return nil;
+    }
+    if (![self.file seekToOffset:AIVPlainHeaderSize error:error]) return nil;
+    _remaining = length.unsignedLongLongValue - AIVPlainHeaderSize;
+    return self;
+}
+
+- (void)dealloc { [self.file closeFile]; }
+
+- (NSData *)readExactly:(NSUInteger)length error:(NSError **)error {
+    if (length > _remaining) {
+        if (error) *error = AIVSErr(36, @"A backup record is truncated.");
+        return nil;
+    }
+    NSMutableData *result = [NSMutableData dataWithCapacity:length];
+    while (result.length < length) {
+        NSData *chunk = [self.file readDataOfLength:MIN(AIVChunk, length - result.length)];
+        if (!chunk.length) {
+            if (error) *error = AIVSErr(37, @"The backup ended while reading a record.");
+            return nil;
+        }
+        [result appendData:chunk];
+    }
+    _remaining -= length;
+    return result;
+}
+
+- (BOOL)atEnd:(NSError **)error {
+    if (_remaining == 0) return YES;
+    if (error) *error = AIVSErr(38, @"Unexpected data after the backup terminator.");
+    return NO;
+}
+@end
+
+static BOOL AIVWriteRecord(id<AIVRecordWriter> writer, uint8_t type,
                            NSString *path, NSData *payload, NSError **error) {
     NSData *name = [path dataUsingEncoding:NSUTF8StringEncoding] ?: [NSData data];
     if (name.length > UINT32_MAX) {
@@ -314,7 +448,7 @@ static BOOL AIVWriteRecord(AIVEncryptedWriter *writer, uint8_t type,
            [writer append:name error:error] && [writer append:payload error:error];
 }
 
-static NSDictionary *AIVParse(AIVEncryptedReader *reader, BOOL restore, NSError **error) {
+static NSDictionary *AIVParse(id<AIVRecordReader> reader, BOOL restore, NSError **error) {
     NSDictionary *manifest = nil;
     NSUInteger files = 0, restored = 0;
     unsigned long long bytes = 0;
@@ -459,7 +593,7 @@ static NSDictionary *AIVParse(AIVEncryptedReader *reader, BOOL restore, NSError 
 
 @implementation AIVStream
 
-+ (BOOL)createBackupAtURL:(NSURL *)url password:(NSString *)password error:(NSError **)error {
++ (BOOL)createBackupAtURL:(NSURL *)url error:(NSError **)error {
     NSMutableArray<NSString *> *scanWarnings = [NSMutableArray array];
     NSArray<NSDictionary *> *descriptors = [AIVArchive fileDescriptorsWithWarnings:scanWarnings error:error];
     if (!descriptors) return NO;
@@ -475,8 +609,7 @@ static NSDictionary *AIVParse(AIVEncryptedReader *reader, BOOL restore, NSError 
     if (![NSFileManager.defaultManager createDirectoryAtURL:snapshotDirectory
         withIntermediateDirectories:YES attributes:nil error:error]) return NO;
     NSURL *partial = [url URLByAppendingPathExtension:@"part"];
-    AIVEncryptedWriter *writer = [[AIVEncryptedWriter alloc] initWithURL:partial
-                                                           password:password error:error];
+    id<AIVRecordWriter> writer = [[AIVPlainWriter alloc] initWithURL:partial error:error];
     if (!writer) {
         [NSFileManager.defaultManager removeItemAtURL:snapshotDirectory error:NULL];
         [NSFileManager.defaultManager removeItemAtURL:partial error:NULL];
@@ -548,13 +681,13 @@ static NSDictionary *AIVParse(AIVEncryptedReader *reader, BOOL restore, NSError 
     return ok;
 }
 
-+ (NSDictionary *)previewAtURL:(NSURL *)url password:(NSString *)password error:(NSError **)error {
-    AIVEncryptedReader *reader = [[AIVEncryptedReader alloc] initWithURL:url password:password error:error];
++ (NSDictionary *)previewAtURL:(NSURL *)url error:(NSError **)error {
+    AIVPlainReader *reader = [[AIVPlainReader alloc] initWithURL:url error:error];
     return reader ? AIVParse(reader, NO, error) : nil;
 }
 
-+ (NSDictionary *)restoreAtURL:(NSURL *)url password:(NSString *)password error:(NSError **)error {
-    AIVEncryptedReader *reader = [[AIVEncryptedReader alloc] initWithURL:url password:password error:error];
++ (NSDictionary *)restoreAtURL:(NSURL *)url error:(NSError **)error {
+    AIVPlainReader *reader = [[AIVPlainReader alloc] initWithURL:url error:error];
     return reader ? AIVParse(reader, YES, error) : nil;
 }
 @end
